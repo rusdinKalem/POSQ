@@ -1,0 +1,38 @@
+---
+description: POS local-first blueprint rules
+globs:
+  - "**/*"
+alwaysApply: true
+---
+
+# POS Blueprint Rules
+
+Follow `AGENT_HANDOFF.md`, `AGENTS.md`, `IMPLEMENTATION_PLAN.md`, `DECISIONS.md`, `STATUS.md`, and `ADR/*.md`.
+
+## Architecture
+
+- Tauri v2 desktop app.
+- Svelte + TypeScript UI.
+- Rust/Tauri commands for local operations.
+- PostgreSQL local is the operational database.
+- PostgreSQL server is the control plane database only.
+
+## Do Not Violate
+
+- Checkout must not require server connectivity.
+- Server must not store full merchant operational database by default.
+- Backup cloud must be opt-in and encrypted client-side.
+- Subscription expiry must use Restricted Expired Mode.
+- Historical data, export, backup, restore, renewal, and security update must remain accessible in expired mode.
+- Private signing key must never be present in desktop code or config.
+- Migration must create a local backup first.
+
+## Agent Workflow
+
+1. Pick a task from `TASK_BACKLOG.md`.
+2. Read the owning spec.
+3. Make a focused change.
+4. Run relevant tests.
+5. Update `STATUS.md`.
+6. Update `DECISIONS.md` or ADR when required.
+
