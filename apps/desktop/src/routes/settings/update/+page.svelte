@@ -1,5 +1,6 @@
 <script lang="ts">
     import { invoke } from '@tauri-apps/api/core';
+    import BackButton from '$lib/components/BackButton.svelte';
 
     let channel = "stable";
     let isChecking = false;
@@ -65,6 +66,7 @@
 </script>
 
 <div class="p-8 max-w-4xl mx-auto">
+    <BackButton />
     <h1 class="text-3xl font-bold mb-6">Pembaruan Sistem (App Update)</h1>
     <p class="text-gray-600 mb-8">Pembaruan POSQ berjalan dengan pengamanan ketat. Setiap migrasi akan di-backup secara otomatis sebelum dieksekusi untuk mencegah kerusakan data toko Anda.</p>
 

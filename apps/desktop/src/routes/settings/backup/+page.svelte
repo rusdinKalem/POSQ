@@ -1,5 +1,6 @@
-<script>
+<script lang="ts">
     import { invoke } from '@tauri-apps/api/core';
+    import BackButton from '$lib/components/BackButton.svelte';
 
     let isEncrypted = true;
     let showRecoveryKeyModal = false;
@@ -17,7 +18,7 @@
         }
 
         try {
-            const res = await invoke('generate_recovery_key');
+            const res: any = await invoke('generate_recovery_key');
             recoveryKey = res.key;
             showRecoveryKeyModal = true;
         } catch (err) {
@@ -31,10 +32,10 @@
         await executeBackup(recoveryKey);
     }
 
-    async function executeBackup(key) {
+    async function executeBackup(key: string | null) {
         statusMessage = "Memproses backup...";
         try {
-            const result = await invoke('create_local_backup', {
+            const result: any = await invoke('create_local_backup', {
                 encrypt: isEncrypted,
                 recoveryKey: key
             });
@@ -56,7 +57,7 @@
 
         statusMessage = "Memproses restore...";
         try {
-            const result = await invoke('restore_local_backup', {
+            const result: any = await invoke('restore_local_backup', {
                 filePath: restorePath,
                 recoveryKey: restoreKey ? restoreKey : null
             });
@@ -72,6 +73,7 @@
 </script>
 
 <div class="p-8 max-w-4xl mx-auto">
+    <BackButton />
     <h1 class="text-3xl font-bold mb-6">Backup & Restore</h1>
 
     {#if statusMessage}
@@ -100,13 +102,13 @@
         
         <div class="space-y-4 max-w-lg">
             <div>
-                <label class="block text-sm font-medium text-gray-700 mb-1">Path File Backup (.sql / .enc)</label>
-                <input type="text" bind:value={restorePath} placeholder="C:\Users\Name\Documents\POSQ_Backups\..." class="w-full border border-gray-300 rounded px-3 py-2" />
+                <label class="block text-sm font-medium text-gray-700 mb-1" for="restorePath">Path File Backup (.sql / .enc)</label>
+                <input id="restorePath" type="text" bind:value={restorePath} placeholder="C:\Users\Name\Documents\POSQ_Backups\..." class="w-full border border-gray-300 rounded px-3 py-2" />
             </div>
             
             <div>
-                <label class="block text-sm font-medium text-gray-700 mb-1">Recovery Key (Kosongkan jika backup tidak dienkripsi)</label>
-                <input type="text" bind:value={restoreKey} placeholder="Masukkan 64-karakter hex key" class="w-full border border-gray-300 rounded px-3 py-2 font-mono text-sm" />
+                <label class="block text-sm font-medium text-gray-700 mb-1" for="restoreKey">Recovery Key (Kosongkan jika backup tidak dienkripsi)</label>
+                <input id="restoreKey" type="text" bind:value={restoreKey} placeholder="Masukkan 64-karakter hex key" class="w-full border border-gray-300 rounded px-3 py-2 font-mono text-sm" />
             </div>
 
             <button on:click={handleRestore} class="bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-6 rounded shadow-md transition-colors mt-2">

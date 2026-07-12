@@ -141,44 +141,11 @@ input:focus, select:focus {
   }
 }
 
-.grid {
-  display: grid;
-  gap: 1rem;
-}
-
-.flex {
-  display: flex;
-}
-
-.flex-col {
-  flex-direction: column;
-}
-
-.items-center {
-  align-items: center;
-}
-
-.justify-between {
-  justify-content: space-between;
-}
-
 .glassmorphism {
   background: rgba(255, 255, 255, 0.7);
   backdrop-filter: blur(10px);
   border: 1px solid rgba(255, 255, 255, 0.3);
 }
 
-.text-2xl { font-size: 1.5rem; }
-.text-xl { font-size: 1.25rem; }
-.text-lg { font-size: 1.125rem; }
-.text-sm { font-size: 0.875rem; }
-.font-bold { font-weight: 700; }
 .text-gray { color: var(--secondary-color); }
 .text-primary { color: var(--primary-color); }
-
-.mt-2 { margin-top: 0.5rem; }
-.mt-4 { margin-top: 1rem; }
-.mb-2 { margin-bottom: 0.5rem; }
-.mb-4 { margin-bottom: 1rem; }
-.p-4 { padding: 1rem; }
-.w-full { width: 100%; }

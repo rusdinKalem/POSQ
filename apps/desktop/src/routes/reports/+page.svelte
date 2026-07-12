@@ -1,6 +1,7 @@
 <script lang="ts">
     import { onMount } from 'svelte';
     import { invoke } from '@tauri-apps/api/core';
+    import { showToast } from '$lib/toast.svelte';
 
     type SalesSummary = {
         total_orders: number;
@@ -61,9 +62,9 @@
             let end = new Date(endDateStr + 'T23:59:59Z').toISOString();
             
             let path: string = await invoke('export_sales_csv', { startDate: start, endDate: end });
-            alert('Berhasil mengekspor Laporan ke CSV!\nLokasi: ' + path);
+            showToast('Berhasil mengekspor Laporan ke CSV!\nLokasi: ' + path);
         } catch (e: any) {
-            alert('Gagal mengekspor laporan: ' + e);
+            showToast('Gagal mengekspor laporan: ' + e, 'error');
         }
     }
 </script>

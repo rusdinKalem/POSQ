@@ -18,12 +18,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_migrations() {
+        std::env::set_var("DATABASE_URL", "sqlite::memory:");
         let pool = establish_connection().await.unwrap();
         let result = run_migrations(&pool).await;
+        if let Err(e) = &result {
+            println!("Migration error: {}", e);
+        }
         assert!(result.is_ok(), "Migrations failed");
         
         // Try running again to test idempotency
         let result2 = run_migrations(&pool).await;
+        if let Err(e) = &result2 {
+            println!("Idempotent migration error: {}", e);
+        }
         assert!(result2.is_ok(), "Idempotent migrations failed");
     }
 }

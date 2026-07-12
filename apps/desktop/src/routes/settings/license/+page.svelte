@@ -1,6 +1,7 @@
 <script lang="ts">
     import { onMount } from 'svelte';
     import { invoke } from '@tauri-apps/api/core';
+    import BackButton from '$lib/components/BackButton.svelte';
 
     let mode = $state("Checking...");
     let token = $state<any>(null);
@@ -55,9 +56,7 @@
 <div class="min-h-screen bg-slate-50/50 py-12 px-4 sm:px-6 lg:px-8 font-sans">
     <div class="max-w-3xl mx-auto">
         <div class="mb-8 flex flex-col gap-3">
-            <a href="/" class="inline-flex items-center text-sm font-semibold text-slate-500 hover:text-blue-600 transition-colors w-fit">
-                <span class="mr-1">←</span> Kembali ke Dashboard
-            </a>
+            <BackButton />
             <h1 class="text-3xl font-extrabold text-slate-900 tracking-tight">Manajemen Lisensi</h1>
             <p class="text-slate-500 text-sm">Kelola status aktivasi dan lisensi kasir lokal POSQ Anda.</p>
         </div>

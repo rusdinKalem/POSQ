@@ -1,9 +1,18 @@
 <script lang="ts">
     import { invoke } from '@tauri-apps/api/core';
+    import { onMount } from 'svelte';
+    import BackButton from '$lib/components/BackButton.svelte';
 
-    let currentMode = "retail"; // "retail" or "fb"
+    let currentMode = "fb"; // "retail" or "fb"
     
-    // Test states
+    onMount(() => {
+        currentMode = localStorage.getItem('businessMode') || 'fb';
+    });
+
+    $: if (typeof localStorage !== 'undefined') {
+        localStorage.setItem('businessMode', currentMode);
+    }
+
     let testActionStatus = "";
     let isProcessing = false;
 
@@ -65,14 +74,15 @@
 </script>
 
 <div class="p-8 max-w-4xl mx-auto">
+    <BackButton />
     <h1 class="text-3xl font-bold mb-6">Mode Bisnis</h1>
-    <p class="text-gray-600 mb-8">Ubah perilaku dan tata letak aplikasi kasir Anda sesuai dengan spesifikasi bisnis. Pilihan ini akan mengaktifkan modul khusus seperti Pengaturan Meja (F&B) atau Retur Penjualan (Retail).</p>
+    <p class="text-gray-600 mb-8">Ubah perilaku dan tata letak aplikasi kasir Anda sesuai dengan spesifikasi bisnis. Pilihan ini akan mengaktifkan modul khusus seperti Pengaturan Meja (F&B), Retur Penjualan (Retail), atau Penugasan Teknisi (Usaha Jasa).</p>
 
     <!-- Mode Toggle -->
     <div class="bg-white shadow rounded-lg p-6 mb-8 border border-gray-200">
         <h2 class="text-xl font-bold mb-4">Pilih Tipe Toko Anda</h2>
         
-        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
             <!-- Retail Card -->
             <!-- svelte-ignore a11y-click-events-have-key-events -->
             <!-- svelte-ignore a11y-no-static-element-interactions -->
@@ -100,12 +110,26 @@
                 </div>
                 <p class="text-sm text-gray-600">Sempurna untuk kafe, restoran, dan kedai. Mendukung pesanan per meja, varian rasa, dan cetak tiket dapur (Kitchen Print).</p>
             </div>
+
+            <!-- Jasa Card -->
+            <!-- svelte-ignore a11y-click-events-have-key-events -->
+            <!-- svelte-ignore a11y-no-static-element-interactions -->
+            <div class="border-2 rounded-lg p-6 cursor-pointer transition-all {currentMode === 'jasa' ? 'border-purple-500 bg-purple-50' : 'border-gray-200 hover:border-purple-300'}"
+                 on:click={() => currentMode = 'jasa'}>
+                <div class="flex items-center justify-between mb-2">
+                    <h3 class="font-bold text-lg text-purple-900">✂️ Usaha Jasa</h3>
+                    {#if currentMode === 'jasa'}
+                        <span class="bg-purple-500 text-white text-xs px-2 py-1 rounded-full">Aktif</span>
+                    {/if}
+                </div>
+                <p class="text-sm text-gray-600">Ideal untuk salon, bengkel, klinik, dan barbershop. Mendukung input nama teknisi/terapis per transaksi.</p>
+            </div>
         </div>
     </div>
 
     <!-- Playground Area -->
     <div class="bg-white shadow rounded-lg p-6 border border-gray-200">
-        <h2 class="text-xl font-bold mb-4 border-b pb-2">Arena Simulasi ({currentMode === 'retail' ? 'Retail' : 'F&B'})</h2>
+        <h2 class="text-xl font-bold mb-4 border-b pb-2">Arena Simulasi ({currentMode === 'retail' ? 'Retail' : currentMode === 'fb' ? 'F&B' : 'Jasa'})</h2>
         
         {#if currentMode === 'retail'}
             <div class="mb-4">
@@ -117,7 +141,7 @@
                     Simulasikan Retur (Process Return)
                 </button>
             </div>
-        {:else}
+        {:else if currentMode === 'fb'}
             <div class="mb-4">
                 <p class="text-sm text-gray-600 mb-4">Dalam mode F&B, sistem secara bawaan melacak nomor meja dan menyortir struk khusus untuk dapur.</p>
                 
@@ -136,6 +160,17 @@
                     class="bg-orange-600 hover:bg-orange-700 text-white font-bold py-2 px-6 rounded shadow transition">
                     Cetak Tiket Dapur Mock (Kitchen Print)
                 </button>
+            </div>
+        {:else}
+            <div class="mb-4">
+                <p class="text-sm text-gray-600 mb-4">Dalam mode Usaha Jasa, sistem berfokus pada nama layanan dan teknisi/terapis yang mengerjakannya.</p>
+                <div class="p-4 border rounded bg-slate-50 flex items-center gap-4">
+                    <span class="text-sm font-bold text-slate-700">Pilih Teknisi:</span>
+                    <select class="p-2 border rounded text-sm w-48">
+                        <option>Budi (Mekanik Senior)</option>
+                        <option>Andi (Mekanik Junior)</option>
+                    </select>
+                </div>
             </div>
         {/if}
 

@@ -1,13 +1,13 @@
 # STATUS
 
 Project: Aplikasi POS SaaS Indonesia - Tauri Local Online  
-Last updated: 2026-07-06  
+Last updated: 2026-07-11  
 Current phase: Release Readiness  
 Current milestone: M14 - Packaging and Release Completed
 
 ## 1. Current Summary
 
-Proyek ini telah menyelesaikan seluruh tahapan pengembangan MVP POSQ (M1-M14). Seluruh fungsionalitas utama seperti kasir offline, manajemen inventaris, pembukuan shift, laporan penjualan, pencatatan audit log, modul F&B & Retail, abstraksi printer, keamanan lisensi, proteksi clock rollback, serta backup lokal AES-256-GCM telah terimplementasi dan diuji melalui static analysis & manual review. Konfigurasi Windows Installer (NSIS) juga telah terpasang di `tauri.conf.json`.
+Proyek ini telah menyelesaikan seluruh tahapan pengembangan MVP POSQ (M1-M14). Seluruh fungsionalitas utama seperti kasir offline, manajemen inventaris, pembukuan shift, laporan penjualan, pencatatan audit log, modul F&B & Retail, abstraksi printer, keamanan lisensi, proteksi clock rollback, serta backup lokal AES-256-GCM telah terimplementasi dan diuji melalui static analysis & manual review. Konfigurasi Windows Installer (NSIS) juga telah terpasang di `tauri.conf.json`. Seluruh Svelte 5 a11y warnings dan TypeScript type errors telah dibersihkan secara penuh dan terverifikasi sukses via `npm run check`. Fungsionalitas hardware abstraction (ADR-0012) serta layout kasir adaptif dengan touch targets minimal 48x48px (numpad, cart quantity adjust, checkout) telah diintegrasikan secara penuh untuk mendukung kesiapan perangkat mobile.
 
 Current source documents:
 
@@ -15,6 +15,7 @@ Current source documents:
 - `docs/WORKFLOW.md`
 - `docs/IMPLEMENTATION_PLAN.md`
 - `docs/ADR/*`
+- `docs/ADR/0012-mobile-vs-desktop-hardware-integration-strategy.md`
 - `docs/TEST_PLAN.md`
 - `docs/DECISIONS.md`
 - `docs/STATUS.md`
@@ -89,6 +90,7 @@ Current source documents:
 | ADR-0009 Restricted Expired Mode and License Enforcement | Prepared |
 | ADR-0010 Control Plane Server Blueprint | Prepared |
 | ADR-0011 Device-Bound License and Zero-Trust Integration | Prepared |
+| ADR-0012 Mobile vs. Desktop Hardware Integration Strategy | Prepared |
 | Server blueprint | Prepared |
 | Server implementation plan | Prepared |
 | Server data model | Prepared |

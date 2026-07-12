@@ -38,8 +38,16 @@ async fn check_report_permission(pool: &SqlitePool) -> Result<uuid::Uuid, String
 pub async fn get_sales_summary(start_date: String, end_date: String, pool: State<'_, SqlitePool>) -> Result<SalesSummary, String> {
     check_report_permission(&pool).await?;
 
-    let start_dt = chrono::DateTime::parse_from_rfc3339(&start_date).map_err(|e| e.to_string())?;
-    let end_dt = chrono::DateTime::parse_from_rfc3339(&end_date).map_err(|e| e.to_string())?;
+    let start_dt = chrono::DateTime::parse_from_rfc3339(&start_date)
+        .map_err(|e| e.to_string())?
+        .with_timezone(&chrono::Utc)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let end_dt = chrono::DateTime::parse_from_rfc3339(&end_date)
+        .map_err(|e| e.to_string())?
+        .with_timezone(&chrono::Utc)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
 
     let record = sqlx::query(
         r#"
@@ -74,15 +82,23 @@ pub async fn get_sales_summary(start_date: String, end_date: String, pool: State
 pub async fn get_payment_breakdown(start_date: String, end_date: String, pool: State<'_, SqlitePool>) -> Result<Vec<PaymentBreakdown>, String> {
     check_report_permission(&pool).await?;
 
-    let start_dt = chrono::DateTime::parse_from_rfc3339(&start_date).map_err(|e| e.to_string())?;
-    let end_dt = chrono::DateTime::parse_from_rfc3339(&end_date).map_err(|e| e.to_string())?;
+    let start_dt = chrono::DateTime::parse_from_rfc3339(&start_date)
+        .map_err(|e| e.to_string())?
+        .with_timezone(&chrono::Utc)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let end_dt = chrono::DateTime::parse_from_rfc3339(&end_date)
+        .map_err(|e| e.to_string())?
+        .with_timezone(&chrono::Utc)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
 
     let records = sqlx::query(
         r#"
         SELECT p.method as payment_method, COALESCE(SUM(p.amount), 0) as total_amount
         FROM payments p
         JOIN orders o ON p.order_id = o.id
-        WHERE p.status = 'success'
+        WHERE p.status = 'paid'
           AND o.created_at >= ?
           AND o.created_at <= ?
         GROUP BY p.method
@@ -106,8 +122,16 @@ pub async fn get_payment_breakdown(start_date: String, end_date: String, pool: S
 pub async fn get_product_ranking(start_date: String, end_date: String, pool: State<'_, SqlitePool>) -> Result<Vec<ProductRanking>, String> {
     check_report_permission(&pool).await?;
 
-    let start_dt = chrono::DateTime::parse_from_rfc3339(&start_date).map_err(|e| e.to_string())?;
-    let end_dt = chrono::DateTime::parse_from_rfc3339(&end_date).map_err(|e| e.to_string())?;
+    let start_dt = chrono::DateTime::parse_from_rfc3339(&start_date)
+        .map_err(|e| e.to_string())?
+        .with_timezone(&chrono::Utc)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let end_dt = chrono::DateTime::parse_from_rfc3339(&end_date)
+        .map_err(|e| e.to_string())?
+        .with_timezone(&chrono::Utc)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
 
     let records = sqlx::query(
         r#"

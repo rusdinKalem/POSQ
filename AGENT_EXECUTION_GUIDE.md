@@ -5,6 +5,10 @@ Purpose: Panduan gradual dari prompt pertama sampai aplikasi POS selesai dibangu
 
 ## 1. Prinsip Utama
 
+> [!IMPORTANT]
+> **ATURAN MUTLAK: JANGAN PERNAH PAKAI BROWSER / SUBAGENT BROWSER!**
+> Developer/owner melarang keras AI agent mengaktifkan browser subagent atau melakukan manipulasi browser. Semua verifikasi dan validasi harus dilakukan secara offline/terminal (seperti `cargo check`, `npm run check`, unit testing), atau diserahkan sepenuhnya ke user untuk testing visual secara manual.
+
 Jangan meminta agent langsung membuat seluruh aplikasi dalam satu prompt. Aplikasi POS ini menyentuh uang, stok, license, backup, database lokal, subscription, dan update. Implementasi harus bertahap, diuji, lalu dikunci sebelum lanjut.
 
 Urutan kerja yang benar:

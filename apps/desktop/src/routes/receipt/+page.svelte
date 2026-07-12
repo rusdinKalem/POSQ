@@ -6,7 +6,10 @@
     let orderId = $page.url.searchParams.get('order_id');
     let receipt: any = null;
 
+    let businessMode = "";
+
     onMount(async () => {
+        businessMode = localStorage.getItem('businessMode') || 'retail';
         if (orderId) {
             try {
                 receipt = await invoke('get_receipt', { orderId });
@@ -31,6 +34,16 @@
             {#if receipt}
                 <div><strong>No:</strong> {receipt.order_number}</div>
                 <div><strong>Tgl:</strong> {receipt.created_at}</div>
+                {#if businessMode === 'fb'}
+                    <div><strong>Tipe:</strong> {receipt.order_type === 'dine_in' ? 'Dine In' : receipt.order_type === 'takeaway' ? 'Take Away' : 'Delivery'}</div>
+                    {#if receipt.table_number}
+                        <div><strong>Meja:</strong> {receipt.table_number}</div>
+                    {/if}
+                {:else if businessMode === 'jasa'}
+                    {#if receipt.table_number}
+                        <div><strong>Teknisi:</strong> {receipt.table_number}</div>
+                    {/if}
+                {/if}
             {/if}
         </div>
 
@@ -40,7 +53,12 @@
             <div class="items-list text-left mb-4">
                 {#each receipt.items as item}
                     <div class="flex justify-between mb-1">
-                        <div>{item.name} x {item.qty}</div>
+                        <div>
+                            <div>{item.name} x {item.qty}</div>
+                            {#if item.notes}
+                                <div class="text-[10px] text-gray-500 italic ml-2 mt-0.5">{item.notes}</div>
+                            {/if}
+                        </div>
                         <div>Rp {item.line_total}</div>
                     </div>
                 {/each}

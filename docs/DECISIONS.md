@@ -63,6 +63,8 @@ Purpose: Record product and architecture decisions so Antigravity agents do not 
 | DEC-054 | License signing key and update signing key must be separate | Accepted | Compromise of one signing domain must not compromise the other |
 | DEC-055 | BYOS validation must include SSRF defenses | Accepted | User-controlled endpoints can target internal/private resources if not validated |
 | DEC-056 | Admin high-risk actions require MFA step-up | Accepted | Subscription override, device revoke, update publish, and key operations are sensitive SaaS controls |
+| DEC-057 | Mobile vs. Desktop Hardware Integration Strategy | Accepted | Decided to use a unified abstraction layer in Svelte/Rust supporting USB/LAN/Serial on Desktop and BLE/Camera on Mobile |
+| DEC-058 | Responsive Layout & Touch-First UI Strategy | Accepted | Decided to use adaptive screen tab navigation on mobile portrait layouts (<768px) and enforce touch target sizes (minimum 48x48px) for crucial POS buttons (numpad, cart quantity adjust, checkout) to support mobile tablet/HP expansion |
 
 ## 2. Decisions Requiring Human Confirmation
 
