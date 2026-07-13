@@ -132,8 +132,8 @@
             <div class="flex items-center gap-3">
                 <div class="w-11 h-11 rounded-2xl bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-2xl">💵</div>
                 <div>
-                    <h1 class="text-2xl font-black tracking-tight text-white leading-none">Tutup Shift & Rekonsiliasi Kas</h1>
-                    <p class="text-sm text-slate-400 mt-0.5">Lakukan perhitungan kas fisik akhir sebelum menutup shift Anda (Blind closing count).</p>
+                    <h1 class="text-2xl font-black tracking-tight text-white leading-none break-words">Tutup Shift & Rekonsiliasi Kas</h1>
+                    <p class="text-sm text-slate-400 mt-0.5 break-words">Lakukan perhitungan kas fisik akhir sebelum menutup shift Anda (Blind closing count).</p>
                 </div>
             </div>
         </div>
@@ -248,11 +248,11 @@
                                 <div class="h-px bg-slate-800"></div>
 
                                 {#if report.recount_required}
-                                    <div class="text-xs text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded-xl p-3 leading-relaxed">
+                                    <div class="text-xs text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded-xl p-3 leading-relaxed break-words">
                                         ⚠️ Selisih kas terdeteksi. Harap hitung kembali uang fisik Anda dengan teliti.
                                     </div>
                                 {:else}
-                                    <div class="text-xs text-red-300 bg-red-500/10 border border-red-500/20 rounded-xl p-3 leading-relaxed">
+                                    <div class="text-xs text-red-300 bg-red-500/10 border border-red-500/20 rounded-xl p-3 leading-relaxed break-words">
                                         🛑 Selisih melampaui toleransi. Supervisor harus memverifikasi dan menyetujui.
                                     </div>
                                     <button

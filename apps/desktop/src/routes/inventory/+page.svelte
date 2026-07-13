@@ -44,9 +44,59 @@
 
     let products: Product[] = $state([]);
     let lowStockItems: LowStockItem[] = $state([]);
-    
+
+    // Loading
+    let loading = $state(true);
+
     // View Switcher
     let viewMode: 'table' | 'card' = $state('table');
+
+    // Search & Filters
+    let searchQuery = $state('');
+    let filterCategory = $state(''); // '' = all
+    let filterStock = $state<'all' | 'normal' | 'critical' | 'out'>('all');
+
+    // Filtered products — client-side search by name/SKU + category + stock status
+    let filteredProducts = $derived.by(() => {
+        const q = searchQuery.trim().toLowerCase();
+        return products.filter(p => {
+            // Search: match name OR sku
+            if (q) {
+                const name = p.name.toLowerCase();
+                const sku = (p.sku || '').toLowerCase();
+                if (!name.includes(q) && !sku.includes(q)) return false;
+            }
+            // Category filter
+            if (filterCategory && p.category_id !== filterCategory) return false;
+            // Stock status filter (only meaningful when stock is tracked)
+            if (filterStock !== 'all') {
+                if (!p.track_stock) return false;
+                const qty = p.qty_on_hand;
+                const min = p.min_qty;
+                if (filterStock === 'out' && qty > 0) return false;
+                if (filterStock === 'critical' && (qty <= 0 || qty > min)) return false;
+                if (filterStock === 'normal' && qty <= min) return false;
+            }
+            return true;
+        });
+    });
+
+    // Inventory summary stats for KPI cards
+    let stats = $derived.by(() => {
+        let totalSku = products.length;
+        let critical = lowStockItems.length;
+        let outOfStock = products.filter(p => p.track_stock && p.qty_on_hand <= 0).length;
+        let inventoryValue = 0;
+        let ingredientCount = 0;
+        for (const p of products) {
+            if (p.is_ingredient) ingredientCount++;
+            if (p.track_stock) {
+                const unitCost = p.cost ?? 0;
+                inventoryValue += p.qty_on_hand * unitCost;
+            }
+        }
+        return { totalSku, critical, outOfStock, inventoryValue, ingredientCount };
+    });
 
     // Modals state (Stock Actions)
     let showModal = $state(false);
@@ -247,14 +297,30 @@
     });
 
     async function fetchData() {
+        loading = true;
         try {
-            products = await invoke('get_inventory_products');
-            lowStockItems = await invoke('get_low_stock');
+            // MUST run sequentially! Both endpoints trigger write transactions to 
+            // recalculate minimum stocks. Running them concurrently with Promise.all 
+            // causes SQLite database locks (SQLITE_BUSY).
+            lowStockItems = await invoke<LowStockItem[]>('get_low_stock');
+            products = await invoke<Product[]>('get_inventory_products');
             await fetchCategories();
         } catch (e) {
             console.error(e);
             showToast('Gagal mengambil data inventaris: ' + e, 'error');
+        } finally {
+            loading = false;
         }
+    }
+
+    function resetFilters() {
+        searchQuery = '';
+        filterCategory = '';
+        filterStock = 'all';
+    }
+
+    function hasActiveFilters() {
+        return searchQuery.trim() !== '' || filterCategory !== '' || filterStock !== 'all';
     }
 
     function openModal(action: string, product: Product) {
@@ -264,6 +330,22 @@
         actionReason = '';
         showModal = true;
     }
+
+    // Contextual metadata for the stock-action modal
+    let modalMeta = $derived.by(() => {
+        switch (modalAction) {
+            case 'in':
+                return { icon: '📥', title: 'Barang Masuk', sub: 'Tambah stok dari supplier/pembelian', accent: 'emerald', accentRgb: '16,185,129' };
+            case 'adjust':
+                return { icon: '⚖️', title: 'Penyesuaian Stok', sub: 'Catat selisih (+ atau -) karena rusak/retur', accent: 'amber', accentRgb: '245,158,11' };
+            case 'opname':
+                return { icon: '🔢', title: 'Stok Opname Fisik', sub: 'Input hasil hitung fisik aktual', accent: 'purple', accentRgb: '147,51,234' };
+            case 'transfer':
+                return { icon: '🚚', title: 'Transfer Keluar', sub: 'Pindahkan stok ke gudang pusat', accent: 'slate', accentRgb: '100,116,139' };
+            default:
+                return { icon: '📦', title: 'Aksi Stok', sub: '', accent: 'blue', accentRgb: '37,99,235' };
+        }
+    });
 
     async function submitAction() {
         if (!selectedProduct) return;
@@ -551,59 +633,168 @@
     }
 </script>
 <div class="p-4 md:p-8 h-screen bg-slate-50 flex flex-col overflow-hidden">
-    <div class="flex flex-col xl:flex-row xl:items-center justify-between gap-4 mb-6 shrink-0">
-        <div class="flex flex-col sm:flex-row sm:items-center justify-between xl:justify-start gap-4">
-            <h1 class="text-xl md:text-2xl font-black text-slate-800 tracking-tight">Inventaris Backoffice</h1>
-            <div class="bg-slate-200/80 p-1 rounded-xl flex gap-1 self-start sm:self-auto border border-slate-300/35">
-                <button type="button" class="px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer {viewMode === 'table' ? 'bg-white shadow-xs text-blue-600' : 'text-slate-600 hover:text-slate-800'}" onclick={() => viewMode = 'table'}>
-                    📊 Tabel
-                </button>
-                <button type="button" class="px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer {viewMode === 'card' ? 'bg-white shadow-xs text-blue-600' : 'text-slate-600 hover:text-slate-800'}" onclick={() => viewMode = 'card'}>
-                    🃏 Kartu
-                </button>
+    <!-- Page Header -->
+    <div class="flex flex-col xl:flex-row xl:items-center justify-between gap-4 mb-5 shrink-0">
+        <div class="flex items-center gap-3">
+            <div class="hidden sm:flex w-11 h-11 rounded-xl bg-blue-600 text-white items-center justify-center text-lg shadow-md shadow-blue-500/10 shrink-0">🗃️</div>
+            <div>
+                <div class="flex items-center gap-2">
+                    <h1 class="text-xl md:text-2xl font-black text-slate-800 tracking-tight">Inventaris Backoffice</h1>
+                    <span class="bg-slate-200/80 text-slate-600 px-2 py-0.5 rounded-full text-[10px] font-extrabold border border-slate-300/40">{stats.totalSku} Item</span>
+                </div>
+                <p class="text-xs text-slate-500 mt-0.5">Kelola produk, stok, resep, dan cetak label harga.</p>
             </div>
         </div>
         <div class="flex flex-wrap gap-2 items-center w-full xl:w-auto">
-            <button class="bg-blue-600 text-white px-3.5 py-2.5 rounded-xl font-bold hover:bg-blue-700 transition text-xs flex-grow sm:flex-initial h-12 flex items-center justify-center cursor-pointer shadow-sm shadow-blue-500/10" onclick={() => showAddProductModal = true}>
-                + Tambah Produk
+            <button class="bg-blue-600 text-white px-3.5 py-2.5 rounded-xl font-bold hover:bg-blue-700 transition text-xs flex-grow sm:flex-initial h-11 flex items-center justify-center gap-1.5 cursor-pointer shadow-sm shadow-blue-500/10" onclick={() => showAddProductModal = true}>
+                <span class="text-sm leading-none">＋</span> Tambah Produk
             </button>
-            <button class="bg-emerald-600 text-white px-3.5 py-2.5 rounded-xl font-bold hover:bg-emerald-700 transition text-xs flex-grow sm:flex-initial h-12 flex items-center justify-center cursor-pointer shadow-sm shadow-emerald-500/10" onclick={triggerFileInput}>
+            <button class="bg-emerald-600 text-white px-3.5 py-2.5 rounded-xl font-bold hover:bg-emerald-700 transition text-xs flex-grow sm:flex-initial h-11 flex items-center justify-center gap-1.5 cursor-pointer shadow-sm shadow-emerald-500/10" onclick={triggerFileInput}>
                 📥 Impor CSV
             </button>
-            <button class="bg-slate-200 text-slate-700 px-3.5 py-2.5 rounded-xl font-bold hover:bg-slate-300 transition text-xs flex-grow sm:flex-initial h-12 flex items-center justify-center cursor-pointer" onclick={downloadSampleCsv}>
+            <button class="bg-white text-slate-700 px-3.5 py-2.5 rounded-xl font-bold hover:bg-slate-100 transition text-xs flex-grow sm:flex-initial h-11 flex items-center justify-center gap-1.5 cursor-pointer border border-slate-200 shadow-xs" onclick={downloadSampleCsv}>
                 📄 Format CSV
             </button>
             <input type="file" bind:this={fileInput} onchange={handleCsvUpload} accept=".csv" style="display: none;" />
-            <a href="/pos" class="btn-outline px-3.5 py-2.5 rounded-xl font-bold border border-slate-300 text-slate-700 hover:bg-slate-100 transition text-xs flex-grow sm:flex-initial h-12 flex items-center justify-center text-center no-underline cursor-pointer">
-                Ke Kasir
+            <a href="/pos" class="px-3.5 py-2.5 rounded-xl font-bold border border-slate-300 text-slate-700 hover:bg-slate-100 transition text-xs flex-grow sm:flex-initial h-11 flex items-center justify-center gap-1.5 text-center no-underline cursor-pointer">
+                🛒 Ke Kasir
             </a>
+        </div>
+    </div>
+
+    <!-- KPI Summary Cards -->
+    <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-5 shrink-0">
+        <div class="bg-white rounded-2xl border border-slate-200 p-4 shadow-xs flex items-center gap-3">
+            <div class="w-10 h-10 rounded-xl bg-blue-50 text-blue-600 flex items-center justify-center text-lg shrink-0">📦</div>
+            <div class="min-w-0">
+                <div class="text-[10px] uppercase font-bold tracking-wider text-slate-400">Total SKU</div>
+                <div class="text-xl font-black text-slate-800 leading-tight">{stats.totalSku}</div>
+            </div>
+        </div>
+        <div class="bg-white rounded-2xl border border-slate-200 p-4 shadow-xs flex items-center gap-3">
+            <div class="w-10 h-10 rounded-xl bg-amber-50 text-amber-600 flex items-center justify-center text-lg shrink-0">⚠️</div>
+            <div class="min-w-0">
+                <div class="text-[10px] uppercase font-bold tracking-wider text-slate-400">Stok Kritis</div>
+                <div class="text-xl font-black text-amber-600 leading-tight">{stats.critical}<span class="text-xs text-slate-400 font-bold ml-1">{stats.outOfStock > 0 ? `· ${stats.outOfStock} habis` : ''}</span></div>
+            </div>
+        </div>
+        <div class="bg-white rounded-2xl border border-slate-200 p-4 shadow-xs flex items-center gap-3">
+            <div class="w-10 h-10 rounded-xl bg-emerald-50 text-emerald-600 flex items-center justify-center text-lg shrink-0">💰</div>
+            <div class="min-w-0">
+                <div class="text-[10px] uppercase font-bold tracking-wider text-slate-400">Nilai Inventaris</div>
+                <div class="text-base font-black text-slate-800 leading-tight truncate">Rp {stats.inventoryValue.toLocaleString('id-ID')}</div>
+            </div>
+        </div>
+        <div class="bg-white rounded-2xl border border-slate-200 p-4 shadow-xs flex items-center gap-3">
+            <div class="w-10 h-10 rounded-xl bg-indigo-50 text-indigo-600 flex items-center justify-center text-lg shrink-0">🧂</div>
+            <div class="min-w-0">
+                <div class="text-[10px] uppercase font-bold tracking-wider text-slate-400">Bahan Baku</div>
+                <div class="text-xl font-black text-slate-800 leading-tight">{stats.ingredientCount}</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Search, Filters & View Switcher Toolbar -->
+    <div class="bg-white rounded-2xl border border-slate-200 shadow-xs p-3 flex flex-col lg:flex-row gap-3 mb-4 shrink-0 lg:items-center justify-between">
+        <!-- Left Group: Search and Filters -->
+        <div class="flex flex-col lg:flex-row flex-grow items-stretch lg:items-center gap-3 min-w-0">
+            <!-- Search -->
+            <div class="relative w-full lg:flex-1 min-w-0">
+                <input
+                    type="text"
+                    bind:value={searchQuery}
+                    placeholder="Cari nama atau SKU produk..."
+                    class="w-full h-[42px] pl-3.5 pr-9 border border-slate-200 rounded-xl text-xs font-semibold bg-slate-50 focus:bg-white focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition-all placeholder:text-slate-400 leading-normal"
+                    style="font-size: 12px;"
+                />
+                {#if searchQuery}
+                    <button type="button" class="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 text-xs w-6 h-6 flex items-center justify-center rounded-full hover:bg-slate-100 transition cursor-pointer" onclick={() => searchQuery = ''} aria-label="Clear search">✕</button>
+                {/if}
+            </div>
+
+            <!-- Category Filter -->
+            <div class="relative w-full lg:flex-1 min-w-0">
+                <select bind:value={filterCategory} class="appearance-none w-full h-[42px] pl-3.5 pr-9 border border-slate-200 rounded-xl text-xs font-semibold bg-slate-50 focus:bg-white focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition-all cursor-pointer text-slate-700 leading-normal" style="font-size: 12px;">
+                    <option value="">Semua Kategori</option>
+                    {#each categoryOptions as cat}
+                        <option value={cat.id}>{cat.name}</option>
+                    {/each}
+                </select>
+                <div class="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-slate-400">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                </div>
+            </div>
+
+            <!-- Stock Status Filter -->
+            <div class="relative w-full lg:flex-1 min-w-0">
+                <select bind:value={filterStock} class="appearance-none w-full h-[42px] pl-3.5 pr-9 border border-slate-200 rounded-xl text-xs font-semibold bg-slate-50 focus:bg-white focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition-all cursor-pointer text-slate-700 leading-normal" style="font-size: 12px;">
+                    <option value="all">Semua Stok</option>
+                    <option value="normal">Stok Normal</option>
+                    <option value="critical">Stok Kritis</option>
+                    <option value="out">Stok Habis</option>
+                </select>
+                <div class="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-slate-400">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+                </div>
+            </div>
+
+            <!-- Reset (only when filtering) -->
+            {#if hasActiveFilters()}
+                <button type="button" class="w-full lg:w-auto shrink-0 h-[42px] px-4 border border-slate-200 rounded-xl text-xs font-bold text-slate-500 hover:text-rose-600 hover:bg-rose-50 transition cursor-pointer flex items-center justify-center gap-1 leading-normal bg-white" onclick={resetFilters}>
+                    ✕ Reset
+                </button>
+            {/if}
+        </div>
+
+        <!-- Right Group: Count & View Switcher -->
+        <div class="flex items-center justify-between lg:justify-end gap-3.5 shrink-0 border-t lg:border-t-0 border-slate-100 pt-3 lg:pt-0">
+            <!-- Result count -->
+            <div class="text-[11px] font-bold text-slate-400 bg-slate-50 px-3 py-2 rounded-xl border border-slate-200/40">
+                {filteredProducts.length} / {products.length} produk
+            </div>
+
+            <!-- View Switcher -->
+            <div class="bg-slate-100 p-1 rounded-xl flex gap-1 border border-slate-200/60">
+                <button type="button" class="px-3.5 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer {viewMode === 'table' ? 'bg-white shadow-xs text-blue-600' : 'text-slate-500 hover:text-slate-700'}" onclick={() => viewMode = 'table'}>
+                    📊 Tabel
+                </button>
+                <button type="button" class="px-3.5 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer {viewMode === 'card' ? 'bg-white shadow-xs text-blue-600' : 'text-slate-500 hover:text-slate-700'}" onclick={() => viewMode = 'card'}>
+                    🃏 Kartu
+                </button>
+            </div>
         </div>
     </div>
 
     <!-- Low Stock Alert Widget -->
     {#if lowStockItems.length > 0}
-        <div class="bg-red-50 border-l-4 border-red-500 p-4 rounded-xl shadow-xs shrink-0 mb-6 flex flex-col sm:flex-row items-start gap-3">
-            <div class="text-red-500 text-xl font-bold mt-0.5 shrink-0">
-                ⚠️
-            </div>
-            <div class="flex-1">
-                <h2 class="font-bold text-red-800 text-sm md:text-base">Peringatan: Ada {lowStockItems.length} produk di bawah batas minimum stok!</h2>
-                <p class="text-xs text-red-600 mt-1 mb-2">Silakan periksa daftar bahan baku/produk di bawah ini untuk menghindari kehabisan stok penjualan:</p>
-                <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2.5 max-h-40 overflow-y-auto pr-2 mt-2">
-                    {#each lowStockItems as item}
-                        <div class="bg-white/80 border border-red-200/50 rounded-lg p-2.5 flex items-center justify-between text-xs shadow-2xs hover:shadow-xs transition duration-200">
-                            <div>
-                                <span class="font-bold text-slate-800 line-clamp-1">{item.name}</span>
-                                <span class="text-slate-400 text-[10px] block font-mono">{item.sku}</span>
+        <div class="bg-gradient-to-r from-amber-50 to-red-50 border border-amber-200 rounded-2xl p-4 shadow-xs shrink-0 mb-4">
+            <div class="flex items-start gap-3">
+                <div class="w-9 h-9 rounded-xl bg-amber-100 text-amber-600 flex items-center justify-center text-lg shrink-0">⚠️</div>
+                <div class="flex-1 min-w-0">
+                    <h2 class="font-extrabold text-amber-800 text-sm">Peringatan Stok Menipis</h2>
+                    <p class="text-xs text-amber-700/80 mt-0.5">Ada <span class="font-bold">{lowStockItems.length} produk</span> di bawah batas minimum. Lakukan pembelian/restock untuk menghindari kehabisan.</p>
+                    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2 max-h-36 overflow-y-auto pr-1 mt-3">
+                        {#each lowStockItems as item}
+                            <div class="bg-white border border-amber-200/70 rounded-xl p-2.5 flex items-center justify-between text-xs shadow-xs hover:shadow-sm hover:border-amber-300 transition cursor-pointer"
+                                 role="button" tabindex="0"
+                                 onclick={() => {
+                                     const p = products.find(x => x.id === item.product_id);
+                                     if (p) openViewModal(p);
+                                 }}
+                                 onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); const p = products.find(x => x.id === item.product_id); if (p) openViewModal(p); } } }>
+                                <div class="min-w-0">
+                                    <span class="font-bold text-slate-800 line-clamp-1 block">{item.name}</span>
+                                    <span class="text-slate-400 text-[10px] block font-mono">{item.sku}</span>
+                                </div>
+                                <div class="text-right whitespace-nowrap pl-2 shrink-0">
+                                    <span class="bg-red-100 text-red-700 px-2 py-0.5 rounded-full font-extrabold text-[10px] block">
+                                        {item.qty_on_hand}
+                                    </span>
+                                    <span class="text-[10px] text-slate-400 block mt-0.5">Min: {item.min_qty}</span>
+                                </div>
                             </div>
-                            <div class="text-right whitespace-nowrap pl-2">
-                                <span class="bg-red-100 text-red-800 px-2 py-0.5 rounded-full font-extrabold text-[10px] block">
-                                    Stok: {item.qty_on_hand}
-                                </span>
-                                <span class="text-[10px] text-slate-400 block mt-0.5">Min: {item.min_qty}</span>
-                            </div>
-                        </div>
-                    {/each}
+                        {/each}
+                    </div>
                 </div>
             </div>
         </div>
@@ -612,98 +803,143 @@
     {#if viewMode === 'table'}
         <div class="bg-white border border-slate-200 rounded-2xl flex-1 overflow-hidden flex flex-col shadow-xs">
             <div class="overflow-auto flex-1">
-                <table class="w-full text-left border-collapse min-w-[800px]">
+                <table class="w-full text-left border-collapse min-w-[860px]">
                     <thead class="bg-slate-50 border-b border-slate-200">
                         <tr>
-                            <th class="p-4 font-extrabold text-slate-600 text-xs uppercase tracking-wider">Produk</th>
-                            <th class="p-4 font-extrabold text-slate-600 text-xs uppercase tracking-wider">SKU</th>
-                            <th class="p-4 font-extrabold text-slate-600 text-xs uppercase tracking-wider">Stok</th>
-                            <th class="p-4 font-extrabold text-slate-600 text-xs uppercase tracking-wider">Min. Stok</th>
-                            <th class="p-4 font-extrabold text-slate-600 text-xs uppercase tracking-wider text-center">Aksi</th>
+                            <th class="p-4 font-extrabold text-slate-500 text-[11px] uppercase tracking-wider">Produk</th>
+                            <th class="p-4 font-extrabold text-slate-500 text-[11px] uppercase tracking-wider">SKU</th>
+                            <th class="p-4 font-extrabold text-slate-500 text-[11px] uppercase tracking-wider text-right">Harga Jual</th>
+                            <th class="p-4 font-extrabold text-slate-500 text-[11px] uppercase tracking-wider">Stok</th>
+                            <th class="p-4 font-extrabold text-slate-500 text-[11px] uppercase tracking-wider">Min. Stok</th>
+                            <th class="p-4 font-extrabold text-slate-500 text-[11px] uppercase tracking-wider text-center">Aksi</th>
                         </tr>
                     </thead>
                     <tbody class="divide-y divide-slate-100">
-                        {#each products as product}
-                            <tr class="hover:bg-slate-50/50 transition-colors">
-                                <td class="p-4 flex items-center gap-3">
-                                    {#if product.image_url}
-                                        <img src={product.image_url} class="w-10 h-10 object-cover rounded-lg shadow-xs border border-slate-200/50" alt={product.name} />
-                                    {:else}
-                                        <div class="w-10 h-10 bg-blue-50 text-blue-500 font-extrabold flex items-center justify-center rounded-lg shadow-xs border border-blue-100/50">
-                                            {product.name.charAt(0).toUpperCase()}
+                        <!-- Loading skeleton -->
+                        {#if loading}
+                            {#each Array(6) as _}
+                                <tr class="bg-white">
+                                    <td class="p-4"><div class="flex items-center gap-3"><div class="w-10 h-10 rounded-lg bg-slate-100 animate-pulse"></div><div class="h-3 w-32 rounded bg-slate-100 animate-pulse"></div></div></td>
+                                    <td class="p-4"><div class="h-3 w-20 rounded bg-slate-100 animate-pulse"></div></td>
+                                    <td class="p-4"><div class="h-3 w-16 rounded bg-slate-100 animate-pulse ml-auto"></div></td>
+                                    <td class="p-4"><div class="h-5 w-12 rounded-full bg-slate-100 animate-pulse"></div></td>
+                                    <td class="p-4"><div class="h-3 w-10 rounded bg-slate-100 animate-pulse"></div></td>
+                                    <td class="p-4"><div class="h-7 w-48 rounded-lg bg-slate-100 animate-pulse mx-auto"></div></td>
+                                </tr>
+                            {/each}
+                        {:else}
+                            {#each filteredProducts as product (product.id)}
+                                <tr class="hover:bg-slate-50/70 transition-colors group">
+                                    <td class="p-4">
+                                        <div class="flex items-center gap-3">
+                                            {#if product.image_url}
+                                                <img src={product.image_url} class="w-10 h-10 object-cover rounded-lg shadow-xs border border-slate-200/60 shrink-0" alt={product.name} />
+                                            {:else}
+                                                <div class="w-10 h-10 bg-blue-50 text-blue-500 font-extrabold flex items-center justify-center rounded-lg shadow-xs border border-blue-100/60 shrink-0">
+                                                    {product.name.charAt(0).toUpperCase()}
+                                                </div>
+                                            {/if}
+                                            <div class="flex items-center gap-2 min-w-0">
+                                                <span class="font-bold text-slate-800 text-sm line-clamp-1">{product.name}</span>
+                                                {#if product.is_ingredient}
+                                                    <span class="bg-indigo-50 text-indigo-700 border border-indigo-100 text-[10px] px-2 py-0.5 rounded-full font-bold whitespace-nowrap shrink-0">Bahan Baku</span>
+                                                {/if}
+                                                {#if !product.track_stock}
+                                                    <span class="bg-slate-100 text-slate-500 text-[10px] px-2 py-0.5 rounded-full font-bold whitespace-nowrap shrink-0">Tak Lacak</span>
+                                                {/if}
+                                            </div>
                                         </div>
-                                    {/if}
-                                    <div class="flex items-center gap-2">
-                                        <span class="font-bold text-slate-800 text-sm">{product.name}</span>
+                                    </td>
+                                    <td class="p-4 text-xs font-mono text-slate-500 whitespace-nowrap">{product.sku}</td>
+                                    <td class="p-4 text-right whitespace-nowrap">
                                         {#if product.is_ingredient}
-                                            <span class="bg-indigo-50 text-indigo-700 border border-indigo-100 text-[10px] px-2 py-0.5 rounded-full font-bold">Bahan Baku</span>
-                                        {/if}
-                                    </div>
-                                </td>
-                                <td class="p-4 text-xs font-mono text-slate-500">{product.sku}</td>
-                                <td class="p-4">
-                                    <span class="inline-block px-3 py-1 rounded-full font-bold text-xs"
-                                          class:bg-red-50={product.qty_on_hand <= product.min_qty}
-                                          class:text-red-600={product.qty_on_hand <= product.min_qty}
-                                          class:bg-blue-50={product.qty_on_hand > product.min_qty}
-                                          class:text-blue-600={product.qty_on_hand > product.min_qty}>
-                                        {product.qty_on_hand}
-                                    </span>
-                                </td>
-                                <td class="p-4">
-                                    {#if product.is_ingredient}
-                                        <div class="text-xs text-slate-700">
-                                            <span class="font-bold text-indigo-700">{product.min_qty}</span>
-                                            <span class="text-slate-400 text-[10px] block font-normal leading-tight">
-                                                Faktor: {product.min_stock_factor}<br>
-                                                Buffer: {product.buffer_stock}<br>
-                                                Lead Time: {product.lead_time_days} Hari
-                                            </span>
-                                        </div>
-                                    {:else}
-                                        <span class="text-xs text-slate-700 font-bold">{product.min_qty}</span>
-                                    {/if}
-                                </td>
-                                <td class="p-4 text-center">
-                                    <div class="inline-flex gap-1.5 items-center">
-                                        <!-- Group 1: Primary actions (fixed widths for alignment) -->
-                                        <button
-                                            class="w-[72px] bg-blue-600 hover:bg-blue-700 text-white px-2 py-2 rounded-lg text-xs font-bold transition flex items-center justify-center gap-1 cursor-pointer"
-                                            onclick={() => openViewModal(product)}
-                                        >👁 Detail</button>
-                                        <button
-                                            class="w-[60px] bg-amber-500 hover:bg-amber-600 text-white px-2 py-2 rounded-lg text-xs font-bold transition flex items-center justify-center gap-1 cursor-pointer"
-                                            onclick={() => openEditModal(product)}
-                                        >✏ Edit</button>
-
-                                        <!-- Resep OR invisible spacer — same width so columns stay aligned -->
-                                        {#if !product.is_ingredient}
-                                            <button
-                                                class="w-[64px] bg-indigo-600 hover:bg-indigo-700 text-white px-2 py-2 rounded-lg text-xs font-bold transition flex items-center justify-center gap-1 cursor-pointer"
-                                                onclick={() => openRecipeModal(product)}
-                                            >🍳 Resep</button>
+                                            <span class="text-xs text-slate-400 italic">—</span>
                                         {:else}
-                                            <span class="w-[64px] inline-block"></span>
+                                            <span class="text-sm font-bold text-slate-700">Rp {product.price.toLocaleString('id-ID')}</span>
                                         {/if}
+                                    </td>
+                                    <td class="p-4">
+                                        {#if !product.track_stock}
+                                            <span class="text-xs text-slate-400 italic">N/A</span>
+                                        {:else}
+                                            {#if product.qty_on_hand <= 0}
+                                                <span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-full font-bold text-xs bg-red-100 text-red-700">
+                                                    <span class="w-1.5 h-1.5 rounded-full bg-red-500"></span> Habis
+                                                </span>
+                                            {:else if product.qty_on_hand <= product.min_qty}
+                                                <span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-full font-bold text-xs bg-amber-100 text-amber-700">
+                                                    <span class="w-1.5 h-1.5 rounded-full bg-amber-500"></span> {product.qty_on_hand} (Kritis)
+                                                </span>
+                                            {:else}
+                                                <span class="inline-flex items-center gap-1 px-2.5 py-1 rounded-full font-bold text-xs bg-emerald-50 text-emerald-700">
+                                                    <span class="w-1.5 h-1.5 rounded-full bg-emerald-500"></span> {product.qty_on_hand}
+                                                </span>
+                                            {/if}
+                                        {/if}
+                                    </td>
+                                    <td class="p-4">
+                                        {#if product.is_ingredient}
+                                            <div class="text-xs text-slate-700">
+                                                <span class="font-bold text-indigo-700">{product.min_qty}</span>
+                                                <span class="text-slate-400 text-[10px] block font-normal leading-tight mt-0.5">
+                                                    Faktor: {product.min_stock_factor} · Buffer: {product.buffer_stock} · LT: {product.lead_time_days}h
+                                                </span>
+                                            </div>
+                                        {:else if !product.track_stock}
+                                            <span class="text-xs text-slate-400 italic">—</span>
+                                        {:else}
+                                            <span class="text-xs text-slate-700 font-bold">{product.min_qty}</span>
+                                        {/if}
+                                    </td>
+                                    <td class="p-4 text-center">
+                                        <div class="inline-flex gap-1.5 items-center justify-center">
+                                            <!-- Group 1: Primary actions (clean outline style) -->
+                                            <button
+                                                class="w-16 h-8 flex items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-600 hover:border-blue-500 hover:text-blue-600 text-[11px] font-bold tracking-wide transition shadow-sm whitespace-nowrap cursor-pointer"
+                                                onclick={() => openViewModal(product)}
+                                            >Detail</button>
+                                            <button
+                                                class="w-14 h-8 flex items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-600 hover:border-amber-500 hover:text-amber-600 text-[11px] font-bold tracking-wide transition shadow-sm whitespace-nowrap cursor-pointer"
+                                                onclick={() => openEditModal(product)}
+                                            >Edit</button>
 
-                                        <!-- Divider -->
-                                        <span class="w-px h-5 bg-slate-200 mx-0.5"></span>
+                                            <!-- Resep OR invisible spacer — exactly w-16 -->
+                                            {#if !product.is_ingredient}
+                                                <button
+                                                    class="w-16 h-8 flex items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-600 hover:border-indigo-500 hover:text-indigo-600 text-[11px] font-bold tracking-wide transition shadow-sm whitespace-nowrap cursor-pointer"
+                                                    onclick={() => openRecipeModal(product)}
+                                                >Resep</button>
+                                            {:else}
+                                                <span class="w-16 inline-block"></span>
+                                            {/if}
 
-                                        <!-- Group 2: Stock actions (all same width) -->
-                                        <button class="w-[46px] bg-green-50 hover:bg-green-100 text-green-700 py-2 rounded-lg text-xs font-bold transition cursor-pointer" onclick={() => openModal('in', product)}>+ In</button>
-                                        <button class="w-[54px] bg-yellow-50 hover:bg-yellow-100 text-yellow-700 py-2 rounded-lg text-xs font-bold transition cursor-pointer" onclick={() => openModal('adjust', product)}>Adjust</button>
-                                        <button class="w-[58px] bg-purple-50 hover:bg-purple-100 text-purple-700 py-2 rounded-lg text-xs font-bold transition cursor-pointer" onclick={() => openModal('opname', product)}>Opname</button>
-                                        <button class="w-[60px] bg-slate-100 hover:bg-slate-200 text-slate-700 py-2 rounded-lg text-xs font-bold transition cursor-pointer" onclick={() => openModal('transfer', product)}>Transfer</button>
-                                    </div>
-                                </td>
-                            </tr>
-                        {/each}
-                        {#if products.length === 0}
-                            <tr>
-                                <td colspan="4" class="p-8 text-center text-slate-450 text-sm">
-                                    Tidak ada produk ditemukan.
-                                </td>
-                            </tr>
+                                            <!-- Divider -->
+                                            <div class="w-px h-6 bg-slate-200 mx-1"></div>
+
+                                            <!-- Group 2: Stock actions (Premium unified outline style) -->
+                                            <button class="w-[52px] h-8 flex items-center justify-center rounded-lg border border-slate-200 bg-white text-emerald-600 hover:bg-emerald-50 hover:border-emerald-300 text-[11px] font-bold tracking-wide transition shadow-sm whitespace-nowrap cursor-pointer" onclick={() => openModal('in', product)}>+ In</button>
+                                            <button class="w-[56px] h-8 flex items-center justify-center rounded-lg border border-slate-200 bg-white text-amber-600 hover:bg-amber-50 hover:border-amber-300 text-[11px] font-bold tracking-wide transition shadow-sm whitespace-nowrap cursor-pointer" onclick={() => openModal('adjust', product)}>Adjust</button>
+                                            <button class="w-[60px] h-8 flex items-center justify-center rounded-lg border border-slate-200 bg-white text-purple-600 hover:bg-purple-50 hover:border-purple-300 text-[11px] font-bold tracking-wide transition shadow-sm whitespace-nowrap cursor-pointer" onclick={() => openModal('opname', product)}>Opname</button>
+                                            <button class="w-[64px] h-8 flex items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-600 hover:bg-slate-50 hover:border-slate-300 text-[11px] font-bold tracking-wide transition shadow-sm whitespace-nowrap cursor-pointer" onclick={() => openModal('transfer', product)}>Transfer</button>
+                                        </div>
+                                    </td>
+                                </tr>
+                            {/each}
+                            {#if filteredProducts.length === 0}
+                                <tr>
+                                    <td colspan="6" class="p-10">
+                                        <div class="flex flex-col items-center justify-center text-center gap-2">
+                                            <span class="text-4xl opacity-60">{hasActiveFilters() ? '🔍' : '📦'}</span>
+                                            <p class="text-slate-500 text-sm font-semibold">{hasActiveFilters() ? 'Tidak ada produk yang cocok dengan filter.' : 'Belum ada produk di inventaris.'}</p>
+                                            {#if hasActiveFilters()}
+                                                <button class="mt-2 text-xs font-bold text-blue-600 hover:text-blue-700 cursor-pointer" onclick={resetFilters}>↺ Reset Filter</button>
+                                            {:else}
+                                                <button class="mt-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-4 py-2 rounded-lg transition cursor-pointer" onclick={() => showAddProductModal = true}>+ Tambah Produk Pertama</button>
+                                            {/if}
+                                        </div>
+                                    </td>
+                                </tr>
+                            {/if}
                         {/if}
                     </tbody>
                 </table>
@@ -712,95 +948,121 @@
     {:else}
         <!-- Card/Grid View -->
         <div class="flex-1 overflow-y-auto pb-8">
-            <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
-                {#each products as product}
-                    <div class="bg-white rounded-2xl shadow-md border border-slate-200 overflow-hidden flex flex-col hover:shadow-lg transition-shadow duration-300">
-                        <!-- Product Image -->
-                        <div class="relative w-full h-40 bg-slate-100 flex items-center justify-center border-b">
-                            {#if product.image_url}
-                                <img src={product.image_url} class="w-full h-full object-cover" alt={product.name} />
-                            {:else}
-                                <div class="w-full h-full bg-slate-200 text-slate-400 font-bold flex items-center justify-center text-4xl">
-                                    {product.name.charAt(0).toUpperCase()}
-                                </div>
-                            {/if}
-                            <!-- Stock Badge -->
-                            <div class="absolute top-3 right-3">
-                                {#if product.qty_on_hand <= product.min_qty}
-                                    <span class="bg-red-500 text-white px-2.5 py-1 rounded-full text-xs font-bold shadow-sm">
-                                        Kritis: {product.qty_on_hand}
-                                    </span>
-                                {:else}
-                                    <span class="bg-blue-600 text-white px-2.5 py-1 rounded-full text-xs font-bold shadow-sm">
-                                        Stok: {product.qty_on_hand}
-                                    </span>
-                                {/if}
+            <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-5">
+                {#if loading}
+                    {#each Array(8) as _}
+                        <div class="bg-white rounded-2xl border border-slate-200 overflow-hidden flex flex-col shadow-xs">
+                            <div class="w-full h-40 bg-slate-100 animate-pulse"></div>
+                            <div class="p-4 flex flex-col gap-2">
+                                <div class="h-2.5 w-20 rounded bg-slate-100 animate-pulse"></div>
+                                <div class="h-4 w-36 rounded bg-slate-100 animate-pulse"></div>
+                                <div class="h-3 w-24 rounded bg-slate-100 animate-pulse"></div>
+                                <div class="h-6 w-28 rounded bg-slate-100 animate-pulse mt-2"></div>
                             </div>
                         </div>
-
-                        <!-- Product Info -->
-                        <div class="p-4 flex-1 flex flex-col">
-                            <span class="text-[10px] uppercase tracking-wider text-slate-400 font-bold">{product.category_name || 'Tanpa Kategori'}</span>
-                            <div class="flex items-center gap-1.5 mt-1">
-                                <h3 class="font-bold text-slate-800 text-base line-clamp-1">{product.name}</h3>
-                                {#if product.is_ingredient}
-                                    <span class="bg-indigo-55 bg-opacity-10 text-indigo-700 border border-indigo-100 text-[9px] px-1.5 py-0.5 rounded-full font-bold whitespace-nowrap">Bahan Baku</span>
-                                {/if}
-                            </div>
-                            <span class="text-xs text-slate-500 mt-0.5">SKU: {product.sku}</span>
-                            <span class="text-xs text-slate-500 mt-0.5">
-                                {#if product.is_ingredient}
-                                    Min. Stok: <strong class="text-indigo-700 font-bold">{product.min_qty}</strong>
-                                    <span class="text-slate-400 text-[10px] block font-normal leading-tight mt-0.5">
-                                        Faktor: {product.min_stock_factor} | Buffer: {product.buffer_stock} | LT: {product.lead_time_days}d
-                                    </span>
+                    {/each}
+                {:else}
+                    {#each filteredProducts as product (product.id)}
+                        <div class="bg-white rounded-2xl shadow-xs hover:shadow-md border border-slate-200 overflow-hidden flex flex-col hover:border-slate-300 transition-all duration-300">
+                            <!-- Product Image -->
+                            <div class="relative w-full h-40 bg-slate-100 flex items-center justify-center border-b border-slate-100">
+                                {#if product.image_url}
+                                    <img src={product.image_url} class="w-full h-full object-cover" alt={product.name} />
                                 {:else}
-                                    Min. Stok: <strong class="text-slate-750">{product.min_qty}</strong>
+                                    <div class="w-full h-full bg-gradient-to-br from-slate-100 to-slate-200 text-slate-300 font-black flex items-center justify-center text-5xl">
+                                        {product.name.charAt(0).toUpperCase()}
+                                    </div>
                                 {/if}
-                            </span>
-                            
-                            <div class="mt-4 flex justify-between items-baseline">
-                                <div>
-                                    <span class="text-[10px] text-slate-400 block font-semibold">Harga Jual</span>
-                                    <span class="font-extrabold text-blue-600 text-lg">Rp {product.price.toLocaleString('id-ID')}</span>
+                                <!-- Stock Badge -->
+                                <div class="absolute top-3 right-3">
+                                    {#if !product.track_stock}
+                                        <span class="bg-slate-700/90 text-white px-2.5 py-1 rounded-full text-xs font-bold shadow-sm backdrop-blur-sm">Tak Lacak</span>
+                                    {:else if product.qty_on_hand <= 0}
+                                        <span class="bg-red-500 text-white px-2.5 py-1 rounded-full text-xs font-bold shadow-sm">Habis</span>
+                                    {:else if product.qty_on_hand <= product.min_qty}
+                                        <span class="bg-amber-500 text-white px-2.5 py-1 rounded-full text-xs font-bold shadow-sm">Kritis: {product.qty_on_hand}</span>
+                                    {:else}
+                                        <span class="bg-emerald-600 text-white px-2.5 py-1 rounded-full text-xs font-bold shadow-sm">Stok: {product.qty_on_hand}</span>
+                                    {/if}
                                 </div>
-                                {#if product.cost}
-                                    <div class="text-right">
-                                        <span class="text-[10px] text-slate-400 block font-semibold">Harga Modal</span>
-                                        <span class="font-bold text-slate-500 text-sm">Rp {product.cost.toLocaleString('id-ID')}</span>
+                                {#if product.is_ingredient}
+                                    <div class="absolute top-3 left-3">
+                                        <span class="bg-indigo-600/90 text-white px-2 py-0.5 rounded-full text-[10px] font-bold shadow-sm backdrop-blur-sm">Bahan Baku</span>
                                     </div>
                                 {/if}
                             </div>
 
-                            <!-- Buttons Section -->
-                            <div class="mt-6 pt-4 border-t border-slate-100 flex flex-col gap-2">
-                                <div class="flex gap-2">
-                                    <button class="flex-1 bg-blue-600 hover:bg-blue-700 text-white py-1.5 rounded-lg text-xs font-bold transition flex justify-center items-center gap-1" onclick={() => openViewModal(product)}>
-                                        👁 Detail
-                                    </button>
-                                    <button class="flex-1 bg-amber-500 hover:bg-amber-600 text-white py-1.5 rounded-lg text-xs font-bold transition flex justify-center items-center gap-1" onclick={() => openEditModal(product)}>
-                                        ✏ Edit
-                                    </button>
+                            <!-- Product Info -->
+                            <div class="p-4 flex-1 flex flex-col">
+                                <span class="text-[10px] uppercase tracking-wider text-slate-400 font-bold">{product.category_name || 'Tanpa Kategori'}</span>
+                                <h3 class="font-bold text-slate-800 text-base line-clamp-1 mt-1">{product.name}</h3>
+                                <span class="text-xs text-slate-500 mt-0.5 font-mono">SKU: {product.sku}</span>
+                                <span class="text-xs text-slate-500 mt-1">
+                                    {#if product.is_ingredient}
+                                        Min. Stok: <strong class="text-indigo-700 font-bold">{product.min_qty}</strong>
+                                        <span class="text-slate-400 text-[10px] block font-normal leading-tight mt-0.5">
+                                            Faktor: {product.min_stock_factor} · Buffer: {product.buffer_stock} · LT: {product.lead_time_days}h
+                                        </span>
+                                    {:else if !product.track_stock}
+                                        <span class="text-slate-400 italic text-[11px]">Stok tidak dilacak</span>
+                                    {:else}
+                                        Min. Stok: <strong class="text-slate-700 font-bold">{product.min_qty}</strong>
+                                    {/if}
+                                </span>
+
+                                <div class="mt-4 flex justify-between items-baseline">
+                                    <div>
+                                        <span class="text-[10px] text-slate-400 block font-semibold">Harga Jual</span>
+                                        {#if product.is_ingredient}
+                                            <span class="font-bold text-slate-400 text-base italic">—</span>
+                                        {:else}
+                                            <span class="font-extrabold text-blue-600 text-lg">Rp {product.price.toLocaleString('id-ID')}</span>
+                                        {/if}
+                                    </div>
+                                    {#if product.cost}
+                                        <div class="text-right">
+                                            <span class="text-[10px] text-slate-400 block font-semibold">Modal</span>
+                                            <span class="font-bold text-slate-500 text-sm">Rp {product.cost.toLocaleString('id-ID')}</span>
+                                        </div>
+                                    {/if}
                                 </div>
-                                {#if !product.is_ingredient}
-                                    <button class="w-full bg-indigo-600 hover:bg-indigo-700 text-white py-1.5 rounded-lg text-xs font-bold transition flex justify-center items-center gap-1 cursor-pointer" onclick={() => openRecipeModal(product)}>
-                                        🍳 Kelola Resep
-                                    </button>
-                                {/if}
-                                <div class="grid grid-cols-4 gap-1 mt-1 text-center">
-                                    <button class="bg-green-50 hover:bg-green-100 text-green-700 py-1 rounded text-[10px] font-bold" onclick={() => openModal('in', product)}>+ In</button>
-                                    <button class="bg-yellow-50 hover:bg-yellow-100 text-yellow-700 py-1 rounded text-[10px] font-bold" onclick={() => openModal('adjust', product)}>Adj</button>
-                                    <button class="bg-purple-50 hover:bg-purple-100 text-purple-700 py-1 rounded text-[10px] font-bold" onclick={() => openModal('opname', product)}>Opn</button>
-                                    <button class="bg-gray-100 hover:bg-gray-200 text-gray-700 py-1 rounded text-[10px] font-bold" onclick={() => openModal('transfer', product)}>Trf</button>
+
+                                <!-- Buttons Section -->
+                                <div class="mt-5 pt-4 border-t border-slate-100 flex flex-col gap-2">
+                                    <div class="flex gap-2">
+                                        <button class="flex-1 bg-blue-600 hover:bg-blue-700 text-white py-1.5 rounded-lg text-xs font-bold transition flex justify-center items-center gap-1 shadow-xs" onclick={() => openViewModal(product)}>
+                                            👁 Detail
+                                        </button>
+                                        <button class="flex-1 bg-amber-500 hover:bg-amber-600 text-white py-1.5 rounded-lg text-xs font-bold transition flex justify-center items-center gap-1 shadow-xs" onclick={() => openEditModal(product)}>
+                                            ✏ Edit
+                                        </button>
+                                    </div>
+                                    {#if !product.is_ingredient}
+                                        <button class="w-full bg-indigo-600 hover:bg-indigo-700 text-white py-1.5 rounded-lg text-xs font-bold transition flex justify-center items-center gap-1 cursor-pointer shadow-xs" onclick={() => openRecipeModal(product)}>
+                                            🍳 Kelola Resep
+                                        </button>
+                                    {/if}
+                                    <div class="grid grid-cols-4 gap-1 mt-1 text-center">
+                                        <button class="bg-emerald-50 hover:bg-emerald-100 text-emerald-700 py-1 rounded-lg text-[10px] font-bold transition cursor-pointer" onclick={() => openModal('in', product)}>+ In</button>
+                                        <button class="bg-yellow-50 hover:bg-yellow-100 text-yellow-700 py-1 rounded-lg text-[10px] font-bold transition cursor-pointer" onclick={() => openModal('adjust', product)}>Adj</button>
+                                        <button class="bg-purple-50 hover:bg-purple-100 text-purple-700 py-1 rounded-lg text-[10px] font-bold transition cursor-pointer" onclick={() => openModal('opname', product)}>Opn</button>
+                                        <button class="bg-slate-100 hover:bg-slate-200 text-slate-700 py-1 rounded-lg text-[10px] font-bold transition cursor-pointer" onclick={() => openModal('transfer', product)}>Trf</button>
+                                    </div>
                                 </div>
                             </div>
                         </div>
-                    </div>
-                {/each}
-                {#if products.length === 0}
-                    <div class="col-span-full bg-white p-12 text-center text-gray-500 rounded-2xl border border-dashed border-slate-300">
-                        Tidak ada produk ditemukan.
-                    </div>
+                    {/each}
+                    {#if filteredProducts.length === 0}
+                        <div class="col-span-full bg-white p-12 rounded-2xl border border-dashed border-slate-300 flex flex-col items-center gap-2 text-center">
+                            <span class="text-4xl opacity-60">{hasActiveFilters() ? '🔍' : '📦'}</span>
+                            <p class="text-slate-500 text-sm font-semibold">{hasActiveFilters() ? 'Tidak ada produk yang cocok dengan filter.' : 'Belum ada produk di inventaris.'}</p>
+                            {#if hasActiveFilters()}
+                                <button class="mt-2 text-xs font-bold text-blue-600 hover:text-blue-700 cursor-pointer" onclick={resetFilters}>↺ Reset Filter</button>
+                            {:else}
+                                <button class="mt-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-4 py-2 rounded-lg transition cursor-pointer" onclick={() => showAddProductModal = true}>+ Tambah Produk Pertama</button>
+                            {/if}
+                        </div>
+                    {/if}
                 {/if}
             </div>
         </div>
@@ -809,34 +1071,78 @@
 
 <!-- ACTION MODAL -->
 {#if showModal}
-<div class="modal-backdrop fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-    <div class="modal-content bg-white p-6 rounded-lg shadow-xl w-full max-w-md">
-        <h2 class="text-xl font-bold mb-4 capitalize">
-            {modalAction === 'in' ? 'Barang Masuk (Stock In)' : 
-             modalAction === 'adjust' ? 'Penyesuaian Stok (Adjustment)' :
-             modalAction === 'opname' ? 'Fisik Stok (Opname)' : 'Transfer Keluar (Ke Gudang)'}
-        </h2>
-        <div class="mb-4">
-            <span class="text-gray-500">Produk:</span> <strong>{selectedProduct?.name}</strong> <br/>
-            <span class="text-gray-500">Stok Sistem:</span> <span class="bg-gray-200 px-2 py-1 rounded text-sm">{selectedProduct?.qty_on_hand}</span>
+<div class="modal-backdrop fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+    <div class="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden">
+        <!-- Header -->
+        <div class="p-5 border-b border-slate-100 flex items-start justify-between gap-3">
+            <div class="flex items-center gap-3 min-w-0">
+                <div class="w-11 h-11 rounded-xl flex items-center justify-center text-xl shrink-0"
+                     style="background-color: rgba({modalMeta.accentRgb}, 0.1); color: rgb({modalMeta.accentRgb});">
+                    {modalMeta.icon}
+                </div>
+                <div class="min-w-0">
+                    <h2 class="text-lg font-extrabold text-slate-800 leading-tight">{modalMeta.title}</h2>
+                    <p class="text-xs text-slate-500 mt-0.5">{modalMeta.sub}</p>
+                </div>
+            </div>
+            <button class="text-slate-400 hover:text-slate-600 text-xl font-bold transition cursor-pointer shrink-0" onclick={() => showModal = false}>✕</button>
         </div>
 
-        <label class="block font-bold mb-2 text-sm" for="actionQty">
-            {#if modalAction === 'in'}Jumlah Masuk (Stok +){/if}
-            {#if modalAction === 'adjust'}Selisih Stok (+ atau -){/if}
-            {#if modalAction === 'opname'}Stok Aktual (Fisik){/if}
-            {#if modalAction === 'transfer'}Jumlah Transfer{/if}
-        </label>
-        <input id="actionQty" type="number" bind:value={actionQty} class="w-full p-2 border rounded mb-4" />
+        <!-- Body -->
+        <div class="p-5 space-y-4">
+            <!-- Product context card -->
+            <div class="flex items-center gap-3 bg-slate-50 border border-slate-200 rounded-xl p-3">
+                {#if selectedProduct?.image_url}
+                    <img src={selectedProduct.image_url} class="w-11 h-11 object-cover rounded-lg border border-slate-200 shrink-0" alt={selectedProduct.name} />
+                {:else}
+                    <div class="w-11 h-11 bg-white text-blue-500 font-extrabold flex items-center justify-center rounded-lg border border-slate-200 shrink-0">
+                        {selectedProduct?.name.charAt(0).toUpperCase()}
+                    </div>
+                {/if}
+                <div class="min-w-0 flex-1">
+                    <div class="font-bold text-slate-800 text-sm line-clamp-1">{selectedProduct?.name}</div>
+                    <div class="text-[10px] text-slate-400 font-mono">{selectedProduct?.sku}</div>
+                </div>
+                <div class="text-right shrink-0 border-l border-slate-200 pl-3">
+                    <div class="text-[10px] uppercase font-bold tracking-wider text-slate-400">Stok Sistem</div>
+                    <div class="text-base font-black text-slate-800">{selectedProduct?.qty_on_hand}</div>
+                </div>
+            </div>
 
-        <label class="block font-bold mb-2 text-sm" for="actionReason">
-            Alasan / Keterangan {modalAction !== 'in' ? '(Wajib)' : '(Opsional)'}
-        </label>
-        <input id="actionReason" type="text" bind:value={actionReason} class="w-full p-2 border rounded mb-6" placeholder="Contoh: Barang rusak, retur, dll" />
+            <!-- Qty input -->
+            <div>
+                <label class="block text-xs font-bold text-slate-600 mb-1.5" for="actionQty">
+                    {#if modalAction === 'in'}Jumlah Masuk (Stok +){/if}
+                    {#if modalAction === 'adjust'}Selisih Stok (+ atau -){/if}
+                    {#if modalAction === 'opname'}Stok Aktual (Fisik){/if}
+                    {#if modalAction === 'transfer'}Jumlah Transfer{/if}
+                </label>
+                <input id="actionQty" type="number" bind:value={actionQty}
+                       class="w-full p-2.5 border border-slate-300 rounded-xl text-sm font-bold focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition-all"
+                       placeholder="0" />
+                {#if modalAction === 'in' && selectedProduct}
+                    <p class="text-[10px] text-slate-400 mt-1.5">Stok setelah aksi: <span class="font-bold text-slate-600">{selectedProduct.qty_on_hand + (actionQty || 0)}</span></p>
+                {/if}
+            </div>
 
-        <div class="flex gap-2">
-            <button class="btn-outline w-full p-3" onclick={() => showModal = false}>Batal</button>
-            <button class="btn-primary w-full p-3 font-bold" onclick={submitAction}>Simpan</button>
+            <!-- Reason input -->
+            <div>
+                <label class="block text-xs font-bold text-slate-600 mb-1.5" for="actionReason">
+                    Alasan / Keterangan
+                    <span class="font-normal text-slate-400">{modalAction !== 'in' ? '(Wajib)' : '(Opsional)'}</span>
+                </label>
+                <input id="actionReason" type="text" bind:value={actionReason}
+                       class="w-full p-2.5 border border-slate-300 rounded-xl text-sm focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition-all"
+                       placeholder="Contoh: Barang rusak, retur, pembelian supplier" />
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <div class="p-5 pt-0 flex gap-2.5">
+            <button class="flex-1 py-2.5 rounded-xl text-sm font-bold text-slate-700 bg-slate-100 hover:bg-slate-200 transition cursor-pointer" onclick={() => showModal = false}>Batal</button>
+            <button class="flex-1 py-2.5 rounded-xl text-sm font-bold text-white transition cursor-pointer shadow-sm hover:brightness-110"
+                    style="background-color: rgb({modalMeta.accentRgb});"
+                    onclick={submitAction}>Simpan</button>
         </div>
     </div>
 </div>
@@ -844,109 +1150,158 @@
 
 <!-- ADD PRODUCT MODAL -->
 {#if showAddProductModal}
-<div class="modal-backdrop fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-    <div class="modal-content bg-white p-6 rounded-lg shadow-xl w-full max-w-md overflow-y-auto max-h-[90vh]">
-        <h2 class="text-xl font-bold mb-4">Tambah Produk Baru (Manual)</h2>
-        
-        <label class="block font-bold mb-1 text-sm" for="newName">Nama Produk *</label>
-        <input id="newName" type="text" bind:value={newName} class="w-full p-2 border rounded mb-3" placeholder="Contoh: Kopi Caramel Latte" />
-
-        <label class="block font-bold mb-1 text-sm" for="newSku">SKU (Kode Produk) *</label>
-        <input id="newSku" type="text" bind:value={newSku} class="w-full p-2 border rounded mb-3" placeholder="Contoh: KCL-001" />
-
-        <label class="block font-bold mb-1 text-sm" for="newCategory">Kategori</label>
-        <select id="newCategory" bind:value={newCategoryId} class="w-full p-2 border rounded mb-3 bg-white">
-            <option value="">-- Tanpa Kategori (Global) --</option>
-            {#each categoryOptions as cat}
-                <option value={cat.id}>{cat.name}</option>
-            {/each}
-        </select>
-
-        <span class="block font-bold mb-1 text-sm">Gambar Produk</span>
-        <div class="flex items-center gap-4 mb-3 p-3 border rounded-xl bg-slate-50 border-slate-200 shadow-sm">
-            {#if newImageUrl}
-                <div class="relative w-16 h-16 border border-slate-200 rounded-lg overflow-hidden bg-white shadow-xs">
-                    <img src={newImageUrl} class="w-full h-full object-cover" alt="Preview" />
-                    <button type="button" class="absolute top-0 right-0 bg-red-600 text-white rounded-bl-lg p-1 text-[10px] font-bold hover:bg-red-700 transition" onclick={() => newImageUrl = ''}>
-                        ✕
-                    </button>
+<div class="modal-backdrop fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+    <div class="bg-white rounded-2xl shadow-2xl w-full max-w-lg overflow-hidden flex flex-col max-h-[92vh]">
+        <!-- Header -->
+        <div class="p-5 border-b border-slate-100 flex items-start justify-between gap-3 shrink-0">
+            <div class="flex items-center gap-3">
+                <div class="w-11 h-11 rounded-xl bg-blue-50 text-blue-600 flex items-center justify-center text-xl shrink-0">＋</div>
+                <div>
+                    <h2 class="text-lg font-extrabold text-slate-800 leading-tight">Tambah Produk Baru</h2>
+                    <p class="text-xs text-slate-500 mt-0.5">Lengkapi informasi produk di bawah ini.</p>
                 </div>
-            {:else}
-                <div class="w-16 h-16 bg-slate-200 text-slate-400 flex items-center justify-center rounded-lg border border-dashed border-slate-300">
-                    📷
+            </div>
+            <button class="text-slate-400 hover:text-slate-600 text-xl font-bold transition cursor-pointer shrink-0" onclick={() => showAddProductModal = false}>✕</button>
+        </div>
+
+        <!-- Body (scrollable) -->
+        <div class="p-5 overflow-y-auto space-y-4">
+            <!-- Group: Identitas -->
+            <div class="space-y-3">
+                <div>
+                    <label class="block text-xs font-bold text-slate-600 mb-1.5" for="newName">Nama Produk <span class="text-rose-500">*</span></label>
+                    <input id="newName" type="text" bind:value={newName}
+                           class="w-full p-2.5 border border-slate-300 rounded-xl text-sm focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition-all"
+                           placeholder="Contoh: Kopi Caramel Latte" />
                 </div>
-            {/if}
-            <div>
-                <button type="button" class="bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 px-3 py-1.5 rounded-lg text-xs font-bold transition" onclick={() => imageInput.click()}>
-                    Pilih File Gambar
-                </button>
-                <input type="file" bind:this={imageInput} onchange={handleImageFileChange} accept="image/*" style="display: none;" />
-                <p class="text-slate-400 text-[10px] mt-1">Format: JPG, PNG, WEBP (Maks 1MB)</p>
-            </div>
-        </div>
-
-        <div class="grid grid-cols-2 gap-3 mb-3">
-            <div>
-                <label class="block font-bold mb-1 text-sm" for="newPrice">Harga Jual (Rp) *</label>
-                <input id="newPrice" type="number" bind:value={newPrice} class="w-full p-2 border rounded" placeholder="28000" />
-            </div>
-            <div>
-                <label class="block font-bold mb-1 text-sm" for="newCost">Harga Modal (Rp)</label>
-                <input id="newCost" type="number" bind:value={newCost} class="w-full p-2 border rounded" placeholder="10000" />
-            </div>
-        </div>
-
-        <div class="flex flex-col gap-2 mb-4 mt-2">
-            <div class="flex items-center gap-2">
-                <input id="newIsIngredient" type="checkbox" bind:checked={newIsIngredient} class="w-4 h-4" />
-                <label for="newIsIngredient" class="text-sm font-bold select-none cursor-pointer text-slate-700">Bahan Baku / Ingredient (Tidak Dijual Langsung)</label>
-            </div>
-            <div class="flex items-center gap-2">
-                <input id="newTrackStock" type="checkbox" bind:checked={newTrackStock} class="w-4 h-4" />
-                <label for="newTrackStock" class="text-sm font-bold select-none cursor-pointer text-slate-700">Lacak & Kelola Stok Inventaris</label>
-            </div>
-        </div>
-
-        {#if newTrackStock}
-        <div class="space-y-3 mb-6">
-            <div>
-                <label class="block font-bold mb-1 text-sm" for="newInitialQty">Jumlah Stok Awal</label>
-                <input id="newInitialQty" type="number" bind:value={newInitialQty} class="w-full p-2 border rounded" placeholder="0" />
-            </div>
-            
-            {#if newIsIngredient}
                 <div class="grid grid-cols-2 gap-3">
                     <div>
-                        <label class="block font-bold mb-1 text-sm flex items-center gap-1 cursor-help" for="newMinStockFactor" title="Untuk bahan baku, stok minimal adalah total kebutuhan resep dikali faktor pengali ini. Contoh: Jika total resep butuh 6 butir telur, dan faktor diisi 5, maka minimal stok = 6 x 5 = 30 butir.">
-                            Faktor Min. Stok (Pengali) ℹ️
-                        </label>
-                        <input id="newMinStockFactor" type="number" bind:value={newMinStockFactor} class="w-full p-2 border rounded" placeholder="5" />
+                        <label class="block text-xs font-bold text-slate-600 mb-1.5" for="newSku">SKU (Kode) <span class="text-rose-500">*</span></label>
+                        <input id="newSku" type="text" bind:value={newSku}
+                               class="w-full p-2.5 border border-slate-300 rounded-xl text-sm font-mono focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition-all"
+                               placeholder="KCL-001" />
                     </div>
                     <div>
-                        <label class="block font-bold mb-1 text-sm flex items-center gap-1 cursor-help" for="newBufferStock" title="Stok cadangan pengaman statis. Minimal bahan baku tidak akan pernah kurang dari angka ini.">
-                            Buffer Stok (Statis) ℹ️
-                        </label>
-                        <input id="newBufferStock" type="number" bind:value={newBufferStock} class="w-full p-2 border rounded" placeholder="10" />
+                        <label class="block text-xs font-bold text-slate-600 mb-1.5" for="newCategory">Kategori</label>
+                        <select id="newCategory" bind:value={newCategoryId}
+                                class="w-full p-2.5 border border-slate-300 rounded-xl text-sm bg-white focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition-all cursor-pointer">
+                            <option value="">Tanpa Kategori</option>
+                            {#each categoryOptions as cat}
+                                <option value={cat.id}>{cat.name}</option>
+                            {/each}
+                        </select>
                     </div>
                 </div>
-                <div>
-                    <label class="block font-bold mb-1 text-sm flex items-center gap-1 cursor-help" for="newLeadTimeDays" title="Waktu tunggu pengiriman dari supplier (dalam hari).">
-                        Durasi Kirim Supplier (Hari) ℹ️
-                    </label>
-                    <input id="newLeadTimeDays" type="number" bind:value={newLeadTimeDays} class="w-full p-2 border rounded" placeholder="2" />
+            </div>
+
+            <!-- Group: Gambar -->
+            <div>
+                <span class="block text-xs font-bold text-slate-600 mb-1.5">Gambar Produk</span>
+                <div class="flex items-center gap-4 p-3 border border-slate-200 rounded-xl bg-slate-50">
+                    {#if newImageUrl}
+                        <div class="relative w-16 h-16 border border-slate-200 rounded-xl overflow-hidden bg-white shadow-xs shrink-0">
+                            <img src={newImageUrl} class="w-full h-full object-cover" alt="Preview" />
+                            <button type="button" class="absolute top-0 right-0 bg-rose-600 text-white rounded-bl-lg p-1 text-[10px] font-bold hover:bg-rose-700 transition cursor-pointer" onclick={() => newImageUrl = ''}>✕</button>
+                        </div>
+                    {:else}
+                        <div class="w-16 h-16 bg-white text-slate-300 flex items-center justify-center rounded-xl border border-dashed border-slate-300 shrink-0 text-2xl">📷</div>
+                    {/if}
+                    <div class="min-w-0">
+                        <button type="button" class="bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 px-3 py-1.5 rounded-lg text-xs font-bold transition cursor-pointer" onclick={() => imageInput.click()}>Pilih File Gambar</button>
+                        <input type="file" bind:this={imageInput} onchange={handleImageFileChange} accept="image/*" style="display: none;" />
+                        <p class="text-slate-400 text-[10px] mt-1">Format: JPG, PNG, WEBP · Maks 1MB</p>
+                    </div>
                 </div>
-            {:else}
-                <div>
-                    <label class="block font-bold mb-1 text-sm" for="newBufferStock">Stok Minimal</label>
-                    <input id="newBufferStock" type="number" bind:value={newBufferStock} class="w-full p-2 border rounded" placeholder="10" />
+            </div>
+
+            <!-- Group: Harga -->
+            <div>
+                <span class="block text-xs font-bold text-slate-600 mb-1.5">Harga</span>
+                <div class="grid grid-cols-2 gap-3">
+                    <div>
+                        <label class="block text-[10px] font-bold text-slate-400 mb-1" for="newPrice">Harga Jual (Rp) <span class="text-rose-500">*</span></label>
+                        <input id="newPrice" type="number" bind:value={newPrice}
+                               class="w-full p-2.5 border border-slate-300 rounded-xl text-sm focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition-all"
+                               placeholder="28000" />
+                    </div>
+                    <div>
+                        <label class="block text-[10px] font-bold text-slate-400 mb-1" for="newCost">Harga Modal (Rp)</label>
+                        <input id="newCost" type="number" bind:value={newCost}
+                               class="w-full p-2.5 border border-slate-300 rounded-xl text-sm focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition-all"
+                               placeholder="10000" />
+                    </div>
                 </div>
+            </div>
+
+            <!-- Group: Tipe & Pelacakan -->
+            <div class="bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-2">
+                <label class="flex items-start gap-2.5 text-sm text-slate-700 cursor-pointer select-none" for="newIsIngredient">
+                    <input id="newIsIngredient" type="checkbox" bind:checked={newIsIngredient} class="w-4 h-4 mt-0.5 rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer" />
+                    <span><span class="font-bold">Bahan Baku / Ingredient</span><span class="block text-[11px] text-slate-500 font-normal mt-0.5">Tidak dijual langsung, dipakai dalam resep menu.</span></span>
+                </label>
+                <label class="flex items-start gap-2.5 text-sm text-slate-700 cursor-pointer select-none" for="newTrackStock">
+                    <input id="newTrackStock" type="checkbox" bind:checked={newTrackStock} class="w-4 h-4 mt-0.5 rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer" />
+                    <span><span class="font-bold">Lacak & Kelola Stok</span><span class="block text-[11px] text-slate-500 font-normal mt-0.5">Aktifkan pencatatan masuk/keluar stok inventaris.</span></span>
+                </label>
+            </div>
+
+            <!-- Group: Stok (conditional) -->
+            {#if newTrackStock}
+            <div class="space-y-3">
+                <div class="flex items-center gap-1.5">
+                    <span class="h-px flex-grow bg-slate-200"></span>
+                    <span class="text-[10px] uppercase font-bold tracking-wider text-slate-400">Pengaturan Stok</span>
+                    <span class="h-px flex-grow bg-slate-200"></span>
+                </div>
+                <div>
+                    <label class="block text-xs font-bold text-slate-600 mb-1.5" for="newInitialQty">Jumlah Stok Awal</label>
+                    <input id="newInitialQty" type="number" bind:value={newInitialQty}
+                           class="w-full p-2.5 border border-slate-300 rounded-xl text-sm focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition-all"
+                           placeholder="0" />
+                </div>
+                {#if newIsIngredient}
+                    <div class="grid grid-cols-2 gap-3">
+                        <div>
+                            <label class="flex items-center gap-1 text-xs font-bold text-slate-600 mb-1.5 cursor-help" for="newMinStockFactor" title="Untuk bahan baku, stok minimal adalah total kebutuhan resep dikali faktor pengali ini. Contoh: Jika total resep butuh 6 butir telur, dan faktor diisi 5, maka minimal stok = 6 x 5 = 30 butir.">
+                                Faktor Min. Stok <span class="text-slate-300">ⓘ</span>
+                            </label>
+                            <input id="newMinStockFactor" type="number" bind:value={newMinStockFactor}
+                                   class="w-full p-2.5 border border-slate-300 rounded-xl text-sm focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition-all"
+                                   placeholder="5" />
+                        </div>
+                        <div>
+                            <label class="flex items-center gap-1 text-xs font-bold text-slate-600 mb-1.5 cursor-help" for="newBufferStock" title="Stok cadangan pengaman statis. Minimal bahan baku tidak akan pernah kurang dari angka ini.">
+                                Buffer Stok <span class="text-slate-300">ⓘ</span>
+                            </label>
+                            <input id="newBufferStock" type="number" bind:value={newBufferStock}
+                                   class="w-full p-2.5 border border-slate-300 rounded-xl text-sm focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition-all"
+                                   placeholder="10" />
+                        </div>
+                    </div>
+                    <div>
+                        <label class="flex items-center gap-1 text-xs font-bold text-slate-600 mb-1.5 cursor-help" for="newLeadTimeDays" title="Waktu tunggu pengiriman dari supplier (dalam hari).">
+                            Durasi Kirim Supplier (Hari) <span class="text-slate-300">ⓘ</span>
+                        </label>
+                        <input id="newLeadTimeDays" type="number" bind:value={newLeadTimeDays}
+                               class="w-full p-2.5 border border-slate-300 rounded-xl text-sm focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition-all"
+                               placeholder="2" />
+                    </div>
+                {:else}
+                    <div>
+                        <label class="block text-xs font-bold text-slate-600 mb-1.5" for="newBufferStock">Stok Minimal</label>
+                        <input id="newBufferStock" type="number" bind:value={newBufferStock}
+                               class="w-full p-2.5 border border-slate-300 rounded-xl text-sm focus:border-blue-400 focus:ring-2 focus:ring-blue-100 transition-all"
+                               placeholder="10" />
+                    </div>
+                {/if}
+            </div>
             {/if}
         </div>
-        {/if}
 
-        <div class="flex gap-2">
-            <button class="btn-outline w-full p-3" onclick={() => showAddProductModal = false}>Batal</button>
-            <button class="btn-primary w-full p-3 font-bold bg-blue-600 hover:bg-blue-700 text-white" onclick={addProduct}>Simpan Produk</button>
+        <!-- Footer -->
+        <div class="p-5 pt-4 border-t border-slate-100 flex gap-2.5 shrink-0">
+            <button class="flex-1 py-2.5 rounded-xl text-sm font-bold text-slate-700 bg-slate-100 hover:bg-slate-200 transition cursor-pointer" onclick={() => showAddProductModal = false}>Batal</button>
+            <button class="flex-[1.5] py-2.5 rounded-xl text-sm font-bold text-white bg-blue-600 hover:bg-blue-700 transition cursor-pointer shadow-sm shadow-blue-500/20" onclick={addProduct}>Simpan Produk</button>
         </div>
     </div>
 </div>
@@ -954,104 +1309,150 @@
 
 <!-- EDIT PRODUCT MODAL -->
 {#if showEditModal}
-<div class="modal-backdrop fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-    <div class="modal-content bg-white p-6 rounded-lg shadow-xl w-full max-w-md overflow-y-auto max-h-[90vh]">
-        <h2 class="text-xl font-bold mb-4">Ubah Informasi Produk</h2>
-        
-        <label class="block font-bold mb-1 text-sm" for="editName">Nama Produk *</label>
-        <input id="editName" type="text" bind:value={editName} class="w-full p-2 border rounded mb-3" placeholder="Contoh: Kopi Caramel Latte" />
-
-        <label class="block font-bold mb-1 text-sm" for="editSku">SKU (Kode Produk) *</label>
-        <input id="editSku" type="text" bind:value={editSku} class="w-full p-2 border rounded mb-3" placeholder="Contoh: KCL-001" />
-
-        <label class="block font-bold mb-1 text-sm" for="editCategory">Kategori</label>
-        <select id="editCategory" bind:value={editCategoryId} class="w-full p-2 border rounded mb-3 bg-white">
-            <option value="">-- Tanpa Kategori (Global) --</option>
-            {#each categoryOptions as cat}
-                <option value={cat.id}>{cat.name}</option>
-            {/each}
-        </select>
-
-        <span class="block font-bold mb-1 text-sm">Gambar Produk</span>
-        <div class="flex items-center gap-4 mb-3 p-3 border rounded-xl bg-slate-50 border-slate-200 shadow-sm">
-            {#if editImageUrl}
-                <div class="relative w-16 h-16 border border-slate-200 rounded-lg overflow-hidden bg-white shadow-xs">
-                    <img src={editImageUrl} class="w-full h-full object-cover" alt="Preview" />
-                    <button type="button" class="absolute top-0 right-0 bg-red-600 text-white rounded-bl-lg p-1 text-[10px] font-bold hover:bg-red-700 transition" onclick={() => editImageUrl = ''}>
-                        ✕
-                    </button>
+<div class="modal-backdrop fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+    <div class="bg-white rounded-2xl shadow-2xl w-full max-w-lg overflow-hidden flex flex-col max-h-[92vh]">
+        <!-- Header -->
+        <div class="p-5 border-b border-slate-100 flex items-start justify-between gap-3 shrink-0">
+            <div class="flex items-center gap-3">
+                <div class="w-11 h-11 rounded-xl bg-amber-50 text-amber-600 flex items-center justify-center text-xl shrink-0">✏️</div>
+                <div>
+                    <h2 class="text-lg font-extrabold text-slate-800 leading-tight">Ubah Produk</h2>
+                    <p class="text-xs text-slate-500 mt-0.5 line-clamp-1">{selectedEditProduct?.name}</p>
                 </div>
-            {:else}
-                <div class="w-16 h-16 bg-slate-200 text-slate-400 flex items-center justify-center rounded-lg border border-dashed border-slate-300">
-                    📷
+            </div>
+            <button class="text-slate-400 hover:text-slate-600 text-xl font-bold transition cursor-pointer shrink-0" onclick={() => showEditModal = false}>✕</button>
+        </div>
+
+        <!-- Body (scrollable) -->
+        <div class="p-5 overflow-y-auto space-y-4">
+            <!-- Group: Identitas -->
+            <div class="space-y-3">
+                <div>
+                    <label class="block text-xs font-bold text-slate-600 mb-1.5" for="editName">Nama Produk <span class="text-rose-500">*</span></label>
+                    <input id="editName" type="text" bind:value={editName}
+                           class="w-full p-2.5 border border-slate-300 rounded-xl text-sm focus:border-amber-400 focus:ring-2 focus:ring-amber-100 transition-all"
+                           placeholder="Contoh: Kopi Caramel Latte" />
                 </div>
-            {/if}
-            <div>
-                <button type="button" class="bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 px-3 py-1.5 rounded-lg text-xs font-bold transition" onclick={() => editImageInput.click()}>
-                    Pilih File Gambar
-                </button>
-                <input type="file" bind:this={editImageInput} onchange={handleEditImageFileChange} accept="image/*" style="display: none;" />
-                <p class="text-slate-400 text-[10px] mt-1">Format: JPG, PNG, WEBP (Maks 1MB)</p>
-            </div>
-        </div>
-
-        <div class="grid grid-cols-2 gap-3 mb-3">
-            <div>
-                <label class="block font-bold mb-1 text-sm" for="editPrice">Harga Jual (Rp) *</label>
-                <input id="editPrice" type="number" bind:value={editPrice} class="w-full p-2 border rounded" />
-            </div>
-            <div>
-                <label class="block font-bold mb-1 text-sm" for="editCost">Harga Modal (Rp)</label>
-                <input id="editCost" type="number" bind:value={editCost} class="w-full p-2 border rounded" />
-            </div>
-        </div>
-
-        <div class="flex flex-col gap-2 mb-6 mt-2">
-            <div class="flex items-center gap-2">
-                <input id="editIsIngredient" type="checkbox" bind:checked={editIsIngredient} class="w-4 h-4" />
-                <label for="editIsIngredient" class="text-sm font-bold select-none cursor-pointer text-slate-700">Bahan Baku / Ingredient (Tidak Dijual Langsung)</label>
-            </div>
-            <div class="flex items-center gap-2">
-                <input id="editTrackStock" type="checkbox" bind:checked={editTrackStock} class="w-4 h-4" />
-                <label for="editTrackStock" class="text-sm font-bold select-none cursor-pointer text-slate-700">Lacak & Kelola Stok Inventaris</label>
-            </div>
-        </div>
-
-        {#if editTrackStock}
-        <div class="space-y-3 mb-6">
-            {#if editIsIngredient}
                 <div class="grid grid-cols-2 gap-3">
                     <div>
-                        <label class="block font-bold mb-1 text-sm flex items-center gap-1 cursor-help" for="editMinStockFactor" title="Untuk bahan baku, stok minimal adalah total kebutuhan resep dikali faktor pengali ini. Contoh: Jika total resep butuh 6 butir telur, dan faktor diisi 5, maka minimal stok = 6 x 5 = 30 butir.">
-                            Faktor Min. Stok (Pengali) ℹ️
-                        </label>
-                        <input id="editMinStockFactor" type="number" bind:value={editMinStockFactor} class="w-full p-2 border rounded" placeholder="5" />
+                        <label class="block text-xs font-bold text-slate-600 mb-1.5" for="editSku">SKU (Kode) <span class="text-rose-500">*</span></label>
+                        <input id="editSku" type="text" bind:value={editSku}
+                               class="w-full p-2.5 border border-slate-300 rounded-xl text-sm font-mono focus:border-amber-400 focus:ring-2 focus:ring-amber-100 transition-all"
+                               placeholder="KCL-001" />
                     </div>
                     <div>
-                        <label class="block font-bold mb-1 text-sm flex items-center gap-1 cursor-help" for="editBufferStock" title="Stok cadangan pengaman statis. Minimal bahan baku tidak akan pernah kurang dari angka ini.">
-                            Buffer Stok (Statis) ℹ️
-                        </label>
-                        <input id="editBufferStock" type="number" bind:value={editBufferStock} class="w-full p-2 border rounded" placeholder="10" />
+                        <label class="block text-xs font-bold text-slate-600 mb-1.5" for="editCategory">Kategori</label>
+                        <select id="editCategory" bind:value={editCategoryId}
+                                class="w-full p-2.5 border border-slate-300 rounded-xl text-sm bg-white focus:border-amber-400 focus:ring-2 focus:ring-amber-100 transition-all cursor-pointer">
+                            <option value="">Tanpa Kategori</option>
+                            {#each categoryOptions as cat}
+                                <option value={cat.id}>{cat.name}</option>
+                            {/each}
+                        </select>
                     </div>
                 </div>
-                <div>
-                    <label class="block font-bold mb-1 text-sm flex items-center gap-1 cursor-help" for="editLeadTimeDays" title="Waktu tunggu pengiriman dari supplier (dalam hari).">
-                        Durasi Kirim Supplier (Hari) ℹ️
-                    </label>
-                    <input id="editLeadTimeDays" type="number" bind:value={editLeadTimeDays} class="w-full p-2 border rounded" placeholder="2" />
+            </div>
+
+            <!-- Group: Gambar -->
+            <div>
+                <span class="block text-xs font-bold text-slate-600 mb-1.5">Gambar Produk</span>
+                <div class="flex items-center gap-4 p-3 border border-slate-200 rounded-xl bg-slate-50">
+                    {#if editImageUrl}
+                        <div class="relative w-16 h-16 border border-slate-200 rounded-xl overflow-hidden bg-white shadow-xs shrink-0">
+                            <img src={editImageUrl} class="w-full h-full object-cover" alt="Preview" />
+                            <button type="button" class="absolute top-0 right-0 bg-rose-600 text-white rounded-bl-lg p-1 text-[10px] font-bold hover:bg-rose-700 transition cursor-pointer" onclick={() => editImageUrl = ''}>✕</button>
+                        </div>
+                    {:else}
+                        <div class="w-16 h-16 bg-white text-slate-300 flex items-center justify-center rounded-xl border border-dashed border-slate-300 shrink-0 text-2xl">📷</div>
+                    {/if}
+                    <div class="min-w-0">
+                        <button type="button" class="bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 px-3 py-1.5 rounded-lg text-xs font-bold transition cursor-pointer" onclick={() => editImageInput.click()}>Pilih File Gambar</button>
+                        <input type="file" bind:this={editImageInput} onchange={handleEditImageFileChange} accept="image/*" style="display: none;" />
+                        <p class="text-slate-400 text-[10px] mt-1">Format: JPG, PNG, WEBP · Maks 1MB</p>
+                    </div>
                 </div>
-            {:else}
-                <div>
-                    <label class="block font-bold mb-1 text-sm" for="editBufferStock">Stok Minimal</label>
-                    <input id="editBufferStock" type="number" bind:value={editBufferStock} class="w-full p-2 border rounded" placeholder="10" />
+            </div>
+
+            <!-- Group: Harga -->
+            <div>
+                <span class="block text-xs font-bold text-slate-600 mb-1.5">Harga</span>
+                <div class="grid grid-cols-2 gap-3">
+                    <div>
+                        <label class="block text-[10px] font-bold text-slate-400 mb-1" for="editPrice">Harga Jual (Rp) <span class="text-rose-500">*</span></label>
+                        <input id="editPrice" type="number" bind:value={editPrice}
+                               class="w-full p-2.5 border border-slate-300 rounded-xl text-sm focus:border-amber-400 focus:ring-2 focus:ring-amber-100 transition-all" />
+                    </div>
+                    <div>
+                        <label class="block text-[10px] font-bold text-slate-400 mb-1" for="editCost">Harga Modal (Rp)</label>
+                        <input id="editCost" type="number" bind:value={editCost}
+                               class="w-full p-2.5 border border-slate-300 rounded-xl text-sm focus:border-amber-400 focus:ring-2 focus:ring-amber-100 transition-all" />
+                    </div>
                 </div>
+            </div>
+
+            <!-- Group: Tipe & Pelacakan -->
+            <div class="bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-2">
+                <label class="flex items-start gap-2.5 text-sm text-slate-700 cursor-pointer select-none" for="editIsIngredient">
+                    <input id="editIsIngredient" type="checkbox" bind:checked={editIsIngredient} class="w-4 h-4 mt-0.5 rounded border-slate-300 text-amber-500 focus:ring-amber-400 cursor-pointer" />
+                    <span><span class="font-bold">Bahan Baku / Ingredient</span><span class="block text-[11px] text-slate-500 font-normal mt-0.5">Tidak dijual langsung, dipakai dalam resep menu.</span></span>
+                </label>
+                <label class="flex items-start gap-2.5 text-sm text-slate-700 cursor-pointer select-none" for="editTrackStock">
+                    <input id="editTrackStock" type="checkbox" bind:checked={editTrackStock} class="w-4 h-4 mt-0.5 rounded border-slate-300 text-amber-500 focus:ring-amber-400 cursor-pointer" />
+                    <span><span class="font-bold">Lacak & Kelola Stok</span><span class="block text-[11px] text-slate-500 font-normal mt-0.5">Aktifkan pencatatan masuk/keluar stok inventaris.</span></span>
+                </label>
+            </div>
+
+            <!-- Group: Stok (conditional) -->
+            {#if editTrackStock}
+            <div class="space-y-3">
+                <div class="flex items-center gap-1.5">
+                    <span class="h-px flex-grow bg-slate-200"></span>
+                    <span class="text-[10px] uppercase font-bold tracking-wider text-slate-400">Pengaturan Stok</span>
+                    <span class="h-px flex-grow bg-slate-200"></span>
+                </div>
+                {#if editIsIngredient}
+                    <div class="grid grid-cols-2 gap-3">
+                        <div>
+                            <label class="flex items-center gap-1 text-xs font-bold text-slate-600 mb-1.5 cursor-help" for="editMinStockFactor" title="Untuk bahan baku, stok minimal adalah total kebutuhan resep dikali faktor pengali ini. Contoh: Jika total resep butuh 6 butir telur, dan faktor diisi 5, maka minimal stok = 6 x 5 = 30 butir.">
+                                Faktor Min. Stok <span class="text-slate-300">ⓘ</span>
+                            </label>
+                            <input id="editMinStockFactor" type="number" bind:value={editMinStockFactor}
+                                   class="w-full p-2.5 border border-slate-300 rounded-xl text-sm focus:border-amber-400 focus:ring-2 focus:ring-amber-100 transition-all"
+                                   placeholder="5" />
+                        </div>
+                        <div>
+                            <label class="flex items-center gap-1 text-xs font-bold text-slate-600 mb-1.5 cursor-help" for="editBufferStock" title="Stok cadangan pengaman statis. Minimal bahan baku tidak akan pernah kurang dari angka ini.">
+                                Buffer Stok <span class="text-slate-300">ⓘ</span>
+                            </label>
+                            <input id="editBufferStock" type="number" bind:value={editBufferStock}
+                                   class="w-full p-2.5 border border-slate-300 rounded-xl text-sm focus:border-amber-400 focus:ring-2 focus:ring-amber-100 transition-all"
+                                   placeholder="10" />
+                        </div>
+                    </div>
+                    <div>
+                        <label class="flex items-center gap-1 text-xs font-bold text-slate-600 mb-1.5 cursor-help" for="editLeadTimeDays" title="Waktu tunggu pengiriman dari supplier (dalam hari).">
+                            Durasi Kirim Supplier (Hari) <span class="text-slate-300">ⓘ</span>
+                        </label>
+                        <input id="editLeadTimeDays" type="number" bind:value={editLeadTimeDays}
+                               class="w-full p-2.5 border border-slate-300 rounded-xl text-sm focus:border-amber-400 focus:ring-2 focus:ring-amber-100 transition-all"
+                               placeholder="2" />
+                    </div>
+                {:else}
+                    <div>
+                        <label class="block text-xs font-bold text-slate-600 mb-1.5" for="editBufferStock">Stok Minimal</label>
+                        <input id="editBufferStock" type="number" bind:value={editBufferStock}
+                               class="w-full p-2.5 border border-slate-300 rounded-xl text-sm focus:border-amber-400 focus:ring-2 focus:ring-amber-100 transition-all"
+                               placeholder="10" />
+                    </div>
+                {/if}
+            </div>
             {/if}
         </div>
-        {/if}
 
-        <div class="flex gap-2">
-            <button class="btn-outline w-full p-3" onclick={() => showEditModal = false}>Batal</button>
-            <button class="btn-primary w-full p-3 font-bold bg-amber-500 hover:bg-amber-600 text-white" onclick={submitEdit}>Simpan Perubahan</button>
+        <!-- Footer -->
+        <div class="p-5 pt-4 border-t border-slate-100 flex gap-2.5 shrink-0">
+            <button class="flex-1 py-2.5 rounded-xl text-sm font-bold text-slate-700 bg-slate-100 hover:bg-slate-200 transition cursor-pointer" onclick={() => showEditModal = false}>Batal</button>
+            <button class="flex-[1.5] py-2.5 rounded-xl text-sm font-bold text-white bg-amber-500 hover:bg-amber-600 transition cursor-pointer shadow-sm shadow-amber-500/20" onclick={submitEdit}>Simpan Perubahan</button>
         </div>
     </div>
 </div>
@@ -1234,7 +1635,7 @@
                 <span class="text-xl">🏷️</span>
                 <h2 class="text-xl font-bold text-slate-800">Pembuat QR & Barcode</h2>
             </div>
-            <button class="text-slate-400 hover:text-slate-650 text-xl font-bold transition-colors cursor-pointer" onclick={() => showBarcodeModal = false}>✕</button>
+            <button class="text-slate-400 hover:text-slate-600 text-xl font-bold transition-colors cursor-pointer" onclick={() => showBarcodeModal = false}>✕</button>
         </div>
 
         <div class="space-y-6">

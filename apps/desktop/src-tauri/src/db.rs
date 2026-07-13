@@ -16,7 +16,10 @@ pub async fn establish_connection() -> Result<SqlitePool, String> {
 
     let connection_options = SqliteConnectOptions::from_str(&database_url)
         .map_err(|e| format!("Invalid connection URL: {}", e))?
-        .create_if_missing(true);
+        .create_if_missing(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+        .busy_timeout(std::time::Duration::from_millis(5000));
 
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
