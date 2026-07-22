@@ -1,13 +1,13 @@
 # STATUS
 
 Project: Aplikasi POS SaaS Indonesia - Tauri Local Online  
-Last updated: 2026-07-11  
+Last updated: 2026-07-23  
 Current phase: Release Readiness  
 Current milestone: M14 - Packaging and Release Completed
 
 ## 1. Current Summary
 
-Proyek ini telah menyelesaikan seluruh tahapan pengembangan MVP POSQ (M1-M14). Seluruh fungsionalitas utama seperti kasir offline, manajemen inventaris, pembukuan shift, laporan penjualan, pencatatan audit log, modul F&B & Retail, abstraksi printer, keamanan lisensi, proteksi clock rollback, serta backup lokal AES-256-GCM telah terimplementasi dan diuji melalui static analysis & manual review. Konfigurasi Windows Installer (NSIS) juga telah terpasang di `tauri.conf.json`. Seluruh Svelte 5 a11y warnings dan TypeScript type errors telah dibersihkan secara penuh dan terverifikasi sukses via `npm run check`. Fungsionalitas hardware abstraction (ADR-0012) serta layout kasir adaptif dengan touch targets minimal 48x48px (numpad, cart quantity adjust, checkout) telah diintegrasikan secara penuh untuk mendukung kesiapan perangkat mobile.
+Proyek ini telah menyelesaikan seluruh tahapan pengembangan MVP POSQ (M1-M14). Seluruh fungsionalitas utama seperti kasir offline, manajemen inventaris, pembukuan shift, laporan penjualan, pencatatan audit log, modul F&B & Retail, abstraksi printer, keamanan lisensi, proteksi clock rollback, serta backup lokal AES-256-GCM telah terimplementasi dan diuji melalui static analysis & manual review. Konfigurasi Windows Installer (NSIS) juga telah terpasang di `tauri.conf.json`. Pengalaman pengguna (UX) kasir telah disempurnakan berdasarkan prinsip POS modern (cepat, minim langkah, aman, informasi transparan, touch targets minimal 48x48px, proteksi double-submit checkout, dan konfirmasi kosongkan keranjang). Kemampuan Offline-First telah disempurnakan berdasarkan benchmark Olsera & Pawoon (Fase P0: Atomic local checkout dengan outbox event `sync_queue` dalam 1 transaksi SQLite, idempotensi outbox key per order, background sync worker idempoten dengan status `SYNCED`/`FAILED`/`DEAD_LETTER`, indikator status koneksi/sync jujur di header POS, dan modal pengawasan sync manager/admin `SyncStatusModal`). Fondasi Omnichannel Inventory & Order Management (Unified Commerce benchmark ala Shopify) telah diselesaikan (Fase P0: Master SKU kanonik, breakdown kuantitas stok per lokasi `qty_on_hand`, `qty_reserved`, `qty_available`, `qty_in_transit`, `qty_damaged_or_quarantine`, model order kanonik dengan kolom `channel`, `external_order_id`, `fulfilment_location_id`, pemisahan status pembayaran & fulfilment, ledger mutasi stok reservasi idempoten `RESERVATION` & `RELEASE_RESERVATION`, serta adapter mock omnichannel). Seluruh pengujian otomatis terverifikasi sukses via `npm run check` (0 error) dan `cargo test` (12/12 passed).
 
 Current source documents:
 

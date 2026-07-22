@@ -1,7 +1,7 @@
 use sqlx::{SqlitePool, Row};
 use tauri::State;
 use uuid::Uuid;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Serialize)]
@@ -143,12 +143,161 @@ pub async fn get_low_stock(pool: State<'_, SqlitePool>) -> Result<Vec<LowStockIt
     Ok(items)
 }
 
+pub struct StockMovementPayload {
+    pub merchant_id: String,
+    pub outlet_id: String,
+    pub product_id: String,
+    pub movement_type: String,
+    pub qty_delta: f64,
+    pub reason: Option<String>,
+    pub reason_code: Option<String>,
+    pub reference_type: Option<String>,
+    pub reference_id: Option<String>,
+    pub idempotency_key: Option<String>,
+    pub created_by: String,
+}
+
+pub async fn process_stock_movement_ledger(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    payload: StockMovementPayload,
+) -> Result<(f64, f64), String> {
+    // 1. Check Idempotency Key
+    if let Some(ref ik) = payload.idempotency_key {
+        if !ik.trim().is_empty() {
+            let existing = sqlx::query(
+                "SELECT stock_before, stock_after FROM stock_movements WHERE outlet_id = ? AND idempotency_key = ? LIMIT 1"
+            )
+            .bind(&payload.outlet_id)
+            .bind(ik)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|e| e.to_string())?;
+
+            if let Some(row) = existing {
+                let sb: f64 = crate::db::get_numeric_as_f64(&row, "stock_before");
+                let sa: f64 = crate::db::get_numeric_as_f64(&row, "stock_after");
+                return Ok((sb, sa));
+            }
+        }
+    }
+
+    // 2. Fetch or initialize inventory item for product
+    let current_rec = sqlx::query(
+        "SELECT merchant_id, outlet_id, qty_on_hand FROM inventory_items WHERE outlet_id = ? AND product_id = ?"
+    )
+    .bind(&payload.outlet_id)
+    .bind(&payload.product_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let stock_before = if let Some(rec) = current_rec {
+        crate::db::get_numeric_as_f64(&rec, "qty_on_hand")
+    } else {
+        // Initialize inventory item record if missing
+        let inv_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO inventory_items (id, merchant_id, outlet_id, product_id, qty_on_hand, min_qty, updated_at) VALUES (?, ?, ?, ?, 0.0, 0.0, CURRENT_TIMESTAMP)"
+        )
+        .bind(&inv_id)
+        .bind(&payload.merchant_id)
+        .bind(&payload.outlet_id)
+        .bind(&payload.product_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| e.to_string())?;
+        0.0
+    };
+
+    let is_reservation_movement = payload.movement_type == "RESERVATION" || payload.movement_type == "RELEASE_RESERVATION";
+    let stock_after = if is_reservation_movement {
+        stock_before
+    } else {
+        stock_before + payload.qty_delta
+    };
+
+    // 3. Negative Stock Policy Check (only for physical deductions)
+    if !is_reservation_movement && stock_after < 0.0 {
+        let allow_neg: String = sqlx::query_scalar("SELECT value FROM system_settings WHERE key = 'allow_negative_stock'")
+            .fetch_optional(&mut **tx)
+            .await
+            .unwrap_or(None)
+            .unwrap_or_else(|| "0".to_string());
+
+        if allow_neg != "1" && allow_neg.to_lowercase() != "true" {
+            let prod_name: String = sqlx::query_scalar("SELECT name FROM products WHERE id = ?")
+                .bind(&payload.product_id)
+                .fetch_optional(&mut **tx)
+                .await
+                .unwrap_or(None)
+                .unwrap_or_else(|| payload.product_id.clone());
+
+            return Err(format!("Stok tidak mencukupi untuk '{}' (tersedia: {}, dibutuhkan: {}). Kebijakan stok negatif dinonaktifkan.", prod_name, stock_before, -payload.qty_delta));
+        }
+    }
+
+    // 4. Update inventory_items qty_on_hand (only for physical movements)
+    if !is_reservation_movement {
+        sqlx::query(
+            "UPDATE inventory_items SET qty_on_hand = ?, updated_at = CURRENT_TIMESTAMP WHERE outlet_id = ? AND product_id = ?"
+        )
+        .bind(stock_after)
+        .bind(&payload.outlet_id)
+        .bind(&payload.product_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+
+    // 5. Insert immutable stock_movements record
+    let movement_id = Uuid::new_v4().to_string();
+    sqlx::query(
+        r#"
+        INSERT INTO stock_movements (
+            id, merchant_id, outlet_id, product_id, movement_type, qty_delta, stock_before, stock_after,
+            reason, reason_code, reference_type, reference_id, idempotency_key, status, created_by, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'posted', ?, CURRENT_TIMESTAMP)
+        "#
+    )
+    .bind(&movement_id)
+    .bind(&payload.merchant_id)
+    .bind(&payload.outlet_id)
+    .bind(&payload.product_id)
+    .bind(&payload.movement_type)
+    .bind(payload.qty_delta)
+    .bind(stock_before)
+    .bind(stock_after)
+    .bind(&payload.reason)
+    .bind(&payload.reason_code)
+    .bind(payload.reference_type.as_deref().unwrap_or("manual"))
+    .bind(&payload.reference_id)
+    .bind(&payload.idempotency_key)
+    .bind(&payload.created_by)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // 6. Record audit log
+    crate::audit::log_action(
+        &mut **tx,
+        payload.merchant_id.clone(),
+        Some(payload.outlet_id.clone()),
+        payload.created_by.clone(),
+        &payload.movement_type,
+        "inventory",
+        Some(payload.product_id.clone()),
+        payload.reason.as_deref()
+    ).await?;
+
+    Ok((stock_before, stock_after))
+}
+
 #[tauri::command]
 pub async fn stock_in(product_id: Uuid, qty: f64, reason: Option<String>, pool: State<'_, SqlitePool>) -> Result<(), String> {
     if qty <= 0.0 {
         return Err("Qty harus lebih dari 0".to_string());
     }
-    process_stock_movement(product_id, qty, "stock_in", reason, pool.inner()).await
+    process_stock_movement(product_id, qty, "STOCK_ADJUSTMENT_IN", reason, pool.inner()).await
 }
 
 #[tauri::command]
@@ -156,13 +305,17 @@ pub async fn adjust_stock(product_id: Uuid, qty_delta: f64, reason: String, pool
     if reason.trim().is_empty() {
         return Err("Alasan (reason) wajib diisi untuk penyesuaian stok".to_string());
     }
-    process_stock_movement(product_id, qty_delta, "adjustment", Some(reason), pool.inner()).await
+    let mtype = if qty_delta >= 0.0 { "STOCK_ADJUSTMENT_IN" } else { "STOCK_ADJUSTMENT_OUT" };
+    process_stock_movement(product_id, qty_delta, mtype, Some(reason), pool.inner()).await
 }
 
 #[tauri::command]
 pub async fn stock_opname(product_id: Uuid, actual_qty: f64, reason: String, pool: State<'_, SqlitePool>) -> Result<(), String> {
-    // SEC-001: Enforce license status to prevent API bypass
     crate::license::enforce_active_license().await?;
+
+    if reason.trim().is_empty() {
+        return Err("Alasan (reason) wajib diisi untuk stock opname".to_string());
+    }
 
     let user_id = crate::auth::get_current_user(pool.inner()).await?;
     let has_perm = crate::auth::has_permission(pool.inner(), user_id, "inventory.manage").await?;
@@ -172,57 +325,45 @@ pub async fn stock_opname(product_id: Uuid, actual_qty: f64, reason: String, poo
 
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
 
-    let current = sqlx::query(
-        "SELECT merchant_id, outlet_id, qty_on_hand FROM inventory_items WHERE product_id = ?"
-    )
-    .bind(product_id.to_string())
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|e| e.to_string())?;
+    let user_rec = sqlx::query("SELECT merchant_id, outlet_id FROM users WHERE id = ?")
+        .bind(user_id.to_string())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
 
-    let current = current.ok_or("Produk tidak ditemukan di inventaris")?;
-    let merchant_id: String = current.get("merchant_id");
-    let outlet_id: String = current.get("outlet_id");
-    
-    let current_qty: f64 = crate::db::get_numeric_as_f64(&current, "qty_on_hand");
-    let qty_delta = actual_qty - current_qty;
+    let merchant_id: String = user_rec.get("merchant_id");
+    let outlet_id: String = user_rec.get::<Option<String>, _>("outlet_id").ok_or("User has no outlet")?;
 
-    sqlx::query(
-        "UPDATE inventory_items SET qty_on_hand = ?, updated_at = CURRENT_TIMESTAMP WHERE product_id = ?"
-    )
-    .bind(actual_qty)
-    .bind(product_id.to_string())
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| e.to_string())?;
+    let current = sqlx::query("SELECT qty_on_hand FROM inventory_items WHERE outlet_id = ? AND product_id = ?")
+        .bind(&outlet_id)
+        .bind(product_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
 
-    let movement_id = Uuid::new_v4();
-    sqlx::query(
-        r#"
-        INSERT INTO stock_movements (id, merchant_id, outlet_id, product_id, movement_type, qty_delta, reason, reference_type, created_by, created_at)
-        VALUES (?, ?, ?, ?, 'opname', ?, ?, 'manual', ?, CURRENT_TIMESTAMP)
-        "#
-    )
-    .bind(movement_id.to_string())
-    .bind(&merchant_id)
-    .bind(&outlet_id)
-    .bind(product_id.to_string())
-    .bind(qty_delta)
-    .bind(&reason)
-    .bind(user_id.to_string())
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| e.to_string())?;
+    let stock_before = if let Some(rec) = current {
+        crate::db::get_numeric_as_f64(&rec, "qty_on_hand")
+    } else {
+        0.0
+    };
 
-    crate::audit::log_action(
-        &mut *tx, 
-        merchant_id, 
-        Some(outlet_id), 
-        user_id.to_string(), 
-        "stock_opname", 
-        "inventory", 
-        Some(product_id.to_string()), 
-        Some(&reason)
+    let qty_delta = actual_qty - stock_before;
+
+    process_stock_movement_ledger(
+        &mut tx,
+        StockMovementPayload {
+            merchant_id,
+            outlet_id,
+            product_id: product_id.to_string(),
+            movement_type: "STOCK_OPNAME".to_string(),
+            qty_delta,
+            reason: Some(reason),
+            reason_code: Some("STOCK_OPNAME".to_string()),
+            reference_type: Some("opname".to_string()),
+            reference_id: None,
+            idempotency_key: Some(format!("opname_{}_{}", product_id, chrono::Utc::now().timestamp_millis())),
+            created_by: user_id.to_string(),
+        }
     ).await?;
 
     tx.commit().await.map_err(|e| e.to_string())?;
@@ -235,12 +376,10 @@ pub async fn transfer_stock(product_id: Uuid, qty: f64, _destination_outlet: Str
     if qty <= 0.0 {
         return Err("Qty harus lebih dari 0".to_string());
     }
-    // Untuk MVP M5, transfer disimulasikan sebagai transfer_out dari toko ini ke gudang.
-    process_stock_movement(product_id, -qty, "transfer_out", Some(reason), pool.inner()).await
+    process_stock_movement(product_id, -qty, "TRANSFER_OUT", Some(reason), pool.inner()).await
 }
 
 async fn process_stock_movement(product_id: Uuid, qty_delta: f64, movement_type: &str, reason: Option<String>, pool: &SqlitePool) -> Result<(), String> {
-    // SEC-001: Enforce license status to prevent API bypass
     crate::license::enforce_active_license().await?;
 
     let user_id = crate::auth::get_current_user(pool).await?;
@@ -251,60 +390,30 @@ async fn process_stock_movement(product_id: Uuid, qty_delta: f64, movement_type:
 
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
 
-    let current = sqlx::query(
-        "SELECT merchant_id, outlet_id, qty_on_hand FROM inventory_items WHERE product_id = ?"
-    )
-    .bind(product_id.to_string())
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|e| e.to_string())?;
+    let user_rec = sqlx::query("SELECT merchant_id, outlet_id FROM users WHERE id = ?")
+        .bind(user_id.to_string())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
 
-    let current = current.ok_or("Produk tidak ditemukan di inventaris")?;
-    let merchant_id: String = current.get("merchant_id");
-    let outlet_id: String = current.get("outlet_id");
-    let current_qty: f64 = crate::db::get_numeric_as_f64(&current, "qty_on_hand");
-    
-    if current_qty + qty_delta < 0.0 {
-        return Err("Stok tidak boleh negatif".to_string());
-    }
+    let merchant_id: String = user_rec.get("merchant_id");
+    let outlet_id: String = user_rec.get::<Option<String>, _>("outlet_id").ok_or("User has no outlet")?;
 
-    sqlx::query(
-        "UPDATE inventory_items SET qty_on_hand = qty_on_hand + ?, updated_at = CURRENT_TIMESTAMP WHERE product_id = ?"
-    )
-    .bind(qty_delta)
-    .bind(product_id.to_string())
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let movement_id = Uuid::new_v4();
-    sqlx::query(
-        r#"
-        INSERT INTO stock_movements (id, merchant_id, outlet_id, product_id, movement_type, qty_delta, reason, reference_type, created_by, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'manual', ?, CURRENT_TIMESTAMP)
-        "#,
-    )
-    .bind(movement_id.to_string())
-    .bind(&merchant_id)
-    .bind(&outlet_id)
-    .bind(product_id.to_string())
-    .bind(movement_type)
-    .bind(qty_delta)
-    .bind(&reason)
-    .bind(user_id.to_string())
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    crate::audit::log_action(
-        &mut *tx, 
-        merchant_id, 
-        Some(outlet_id), 
-        user_id.to_string(), 
-        movement_type, 
-        "inventory", 
-        Some(product_id.to_string()), 
-        reason.as_deref()
+    process_stock_movement_ledger(
+        &mut tx,
+        StockMovementPayload {
+            merchant_id,
+            outlet_id,
+            product_id: product_id.to_string(),
+            movement_type: movement_type.to_string(),
+            qty_delta,
+            reason,
+            reason_code: Some(movement_type.to_string()),
+            reference_type: Some("manual".to_string()),
+            reference_id: None,
+            idempotency_key: Some(format!("manual_{}_{}_{}", movement_type, product_id, chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0))),
+            created_by: user_id.to_string(),
+        }
     ).await?;
 
     tx.commit().await.map_err(|e| e.to_string())?;
@@ -1250,6 +1359,778 @@ pub async fn save_recipe(
 
     tx.commit().await.map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct OmnichannelStockBreakdown {
+    pub product_id: String,
+    pub location_id: String,
+    pub qty_on_hand: f64,
+    pub qty_reserved: f64,
+    pub qty_available: f64,
+    pub qty_in_transit: f64,
+    pub qty_damaged_or_quarantine: f64,
+}
+
+pub async fn get_product_stock_breakdown(
+    pool: &SqlitePool,
+    location_id: &str,
+    product_id: &str,
+) -> Result<OmnichannelStockBreakdown, String> {
+    let row = sqlx::query(
+        r#"
+        SELECT product_id, COALESCE(location_id, outlet_id) as location_id,
+               qty_on_hand, qty_reserved, qty_in_transit, qty_damaged_or_quarantine
+        FROM inventory_items
+        WHERE (outlet_id = ? OR location_id = ?) AND product_id = ?
+        LIMIT 1
+        "#
+    )
+    .bind(location_id)
+    .bind(location_id)
+    .bind(product_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if let Some(r) = row {
+        let qoh = crate::db::get_numeric_as_f64(&r, "qty_on_hand");
+        let qres = crate::db::get_numeric_as_f64(&r, "qty_reserved");
+        let qtransit = crate::db::get_numeric_as_f64(&r, "qty_in_transit");
+        let qdamaged = crate::db::get_numeric_as_f64(&r, "qty_damaged_or_quarantine");
+        let qavail = (qoh - qres - qdamaged).max(0.0);
+
+        Ok(OmnichannelStockBreakdown {
+            product_id: product_id.to_string(),
+            location_id: location_id.to_string(),
+            qty_on_hand: qoh,
+            qty_reserved: qres,
+            qty_available: qavail,
+            qty_in_transit: qtransit,
+            qty_damaged_or_quarantine: qdamaged,
+        })
+    } else {
+        Ok(OmnichannelStockBreakdown {
+            product_id: product_id.to_string(),
+            location_id: location_id.to_string(),
+            qty_on_hand: 0.0,
+            qty_reserved: 0.0,
+            qty_available: 0.0,
+            qty_in_transit: 0.0,
+            qty_damaged_or_quarantine: 0.0,
+        })
+    }
+}
+
+pub async fn reserve_omnichannel_stock(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    merchant_id: &str,
+    location_id: &str,
+    product_id: &str,
+    qty: f64,
+    order_id: &str,
+    user_id: &str,
+) -> Result<(), String> {
+    if qty <= 0.0 {
+        return Ok(());
+    }
+
+    let row = sqlx::query(
+        "SELECT qty_on_hand, qty_reserved, qty_damaged_or_quarantine FROM inventory_items WHERE (outlet_id = ? OR location_id = ?) AND product_id = ?"
+    )
+    .bind(location_id)
+    .bind(location_id)
+    .bind(product_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (qoh, qres, qdam) = if let Some(r) = row {
+        (
+            crate::db::get_numeric_as_f64(&r, "qty_on_hand"),
+            crate::db::get_numeric_as_f64(&r, "qty_reserved"),
+            crate::db::get_numeric_as_f64(&r, "qty_damaged_or_quarantine"),
+        )
+    } else {
+        (0.0, 0.0, 0.0)
+    };
+
+    let qavail = qoh - qres - qdam;
+    if qavail < qty {
+        let allow_neg: String = sqlx::query_scalar("SELECT value FROM system_settings WHERE key = 'allow_negative_stock'")
+            .fetch_optional(&mut **tx)
+            .await
+            .unwrap_or(None)
+            .unwrap_or_else(|| "0".to_string());
+
+        if allow_neg != "1" && allow_neg.to_lowercase() != "true" {
+            return Err(format!("Stok tersedia ({}) tidak mencukupi untuk reservasi (dibutuhkan: {}).", qavail, qty));
+        }
+    }
+
+    sqlx::query(
+        "UPDATE inventory_items SET qty_reserved = qty_reserved + ?, updated_at = CURRENT_TIMESTAMP WHERE (outlet_id = ? OR location_id = ?) AND product_id = ?"
+    )
+    .bind(qty)
+    .bind(location_id)
+    .bind(location_id)
+    .bind(product_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let ik = format!("reserve_{}_{}", order_id, product_id);
+    let movement_payload = StockMovementPayload {
+        merchant_id: merchant_id.to_string(),
+        outlet_id: location_id.to_string(),
+        product_id: product_id.to_string(),
+        movement_type: "RESERVATION".to_string(),
+        qty_delta: qty,
+        reason: Some(format!("Reservasi stok untuk order {}", order_id)),
+        reason_code: Some("RESERVATION".to_string()),
+        reference_type: Some("order_reservation".to_string()),
+        reference_id: Some(order_id.to_string()),
+        idempotency_key: Some(ik),
+        created_by: user_id.to_string(),
+    };
+
+    let _ = process_stock_movement_ledger(tx, movement_payload).await?;
+    Ok(())
+}
+
+pub async fn release_omnichannel_reservation(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    merchant_id: &str,
+    location_id: &str,
+    product_id: &str,
+    qty: f64,
+    order_id: &str,
+    user_id: &str,
+) -> Result<(), String> {
+    if qty <= 0.0 {
+        return Ok(());
+    }
+
+    let ik = format!("release_{}_{}", order_id, product_id);
+    let existing = sqlx::query_scalar::<_, String>("SELECT id FROM stock_movements WHERE idempotency_key = ?")
+        .bind(&ik)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if existing.is_some() {
+        return Ok(());
+    }
+
+    sqlx::query(
+        "UPDATE inventory_items SET qty_reserved = MAX(0.0, qty_reserved - ?), updated_at = CURRENT_TIMESTAMP WHERE (outlet_id = ? OR location_id = ?) AND product_id = ?"
+    )
+    .bind(qty)
+    .bind(location_id)
+    .bind(location_id)
+    .bind(product_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let movement_payload = StockMovementPayload {
+        merchant_id: merchant_id.to_string(),
+        outlet_id: location_id.to_string(),
+        product_id: product_id.to_string(),
+        movement_type: "RELEASE_RESERVATION".to_string(),
+        qty_delta: -qty,
+        reason: Some(format!("Pelepasan reservasi stok untuk order {}", order_id)),
+        reason_code: Some("RELEASE_RESERVATION".to_string()),
+        reference_type: Some("release_reservation".to_string()),
+        reference_id: Some(order_id.to_string()),
+        idempotency_key: Some(ik),
+        created_by: user_id.to_string(),
+    };
+
+    let _ = process_stock_movement_ledger(tx, movement_payload).await?;
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OmnichannelItemPayload {
+    pub product_id: Option<String>,
+    pub sku: Option<String>,
+    pub name: String,
+    pub qty: f64,
+    pub price: i32,
+    pub notes: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateOmnichannelOrderPayload {
+    pub channel: String,
+    pub external_order_id: Option<String>,
+    pub items: Vec<OmnichannelItemPayload>,
+    pub fulfilment_type: String,
+    pub location_id: Option<String>,
+}
+
+#[tauri::command]
+pub async fn create_omnichannel_order(
+    payload: CreateOmnichannelOrderPayload,
+    pool: State<'_, SqlitePool>,
+) -> Result<String, String> {
+    crate::license::enforce_active_license().await?;
+    let user_id = crate::auth::get_current_user(pool.inner()).await?;
+
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+
+    let user_record = sqlx::query("SELECT merchant_id, outlet_id FROM users WHERE id = ?")
+        .bind(user_id.to_string())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let merchant_id: String = user_record.get("merchant_id");
+    let outlet_id: String = user_record.get::<Option<String>, _>("outlet_id").ok_or("User has no outlet")?;
+    let loc_id = payload.location_id.unwrap_or_else(|| outlet_id.clone());
+
+    if let Some(ref ext_id) = payload.external_order_id {
+        let existing: Option<String> = sqlx::query_scalar("SELECT id FROM orders WHERE merchant_id = ? AND channel = ? AND external_order_id = ?")
+            .bind(&merchant_id)
+            .bind(&payload.channel)
+            .bind(ext_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if let Some(ord_id) = existing {
+            tx.commit().await.map_err(|e| e.to_string())?;
+            return Ok(ord_id);
+        }
+    }
+
+    let order_id = Uuid::new_v4().to_string();
+    let order_number = format!("ORD-{}-{}", payload.channel.to_uppercase(), chrono::Utc::now().format("%Y%m%d%H%M%S"));
+
+    let mut subtotal: i32 = 0;
+    for item in &payload.items {
+        subtotal += item.price * (item.qty as i32);
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO orders (
+            id, merchant_id, outlet_id, order_number, status, channel, external_order_id,
+            payment_status, fulfilment_status, fulfilment_location_id, grand_total, subtotal,
+            created_by, created_at
+        ) VALUES (?, ?, ?, ?, 'completed', ?, ?, 'paid', 'allocated', ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        "#
+    )
+    .bind(&order_id)
+    .bind(&merchant_id)
+    .bind(&outlet_id)
+    .bind(&order_number)
+    .bind(&payload.channel)
+    .bind(&payload.external_order_id)
+    .bind(&loc_id)
+    .bind(subtotal)
+    .bind(subtotal)
+    .bind(user_id.to_string())
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    for item in &payload.items {
+        let item_id = Uuid::new_v4().to_string();
+        let line_total = item.price * (item.qty as i32);
+        sqlx::query(
+            r#"
+            INSERT INTO order_items (id, order_id, product_id, sku, name, qty, unit_price, line_total, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#
+        )
+        .bind(&item_id)
+        .bind(&order_id)
+        .bind(&item.product_id)
+        .bind(&item.sku)
+        .bind(&item.name)
+        .bind(item.qty)
+        .bind(item.price)
+        .bind(line_total)
+        .bind(&item.notes)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        if let Some(ref prod_id) = item.product_id {
+            reserve_omnichannel_stock(&mut tx, &merchant_id, &loc_id, prod_id, item.qty, &order_id, &user_id.to_string()).await?;
+        }
+    }
+
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(order_id)
+}
+
+#[tauri::command]
+pub async fn fulfill_omnichannel_order(
+    order_id: String,
+    pool: State<'_, SqlitePool>,
+) -> Result<(), String> {
+    crate::license::enforce_active_license().await?;
+    let user_id = crate::auth::get_current_user(pool.inner()).await?;
+
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+
+    let order = sqlx::query("SELECT merchant_id, outlet_id, COALESCE(fulfilment_location_id, outlet_id) as location_id, fulfilment_status FROM orders WHERE id = ?")
+        .bind(&order_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("Order tidak ditemukan")?;
+
+    let merchant_id: String = order.get("merchant_id");
+    let loc_id: String = order.get("location_id");
+    let current_status: String = order.get("fulfilment_status");
+
+    if current_status == "completed" {
+        tx.commit().await.map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    let items = sqlx::query("SELECT product_id, qty FROM order_items WHERE order_id = ? AND product_id IS NOT NULL")
+        .bind(&order_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    for item in items {
+        let prod_id: String = item.get("product_id");
+        let qty = crate::db::get_numeric_as_f64(&item, "qty");
+
+        // Deduct physically and release reservation
+        let ik = format!("fulfill_{}_{}", order_id, prod_id);
+        let _ = process_stock_movement_ledger(&mut tx, StockMovementPayload {
+            merchant_id: merchant_id.clone(),
+            outlet_id: loc_id.clone(),
+            product_id: prod_id.clone(),
+            movement_type: "SALE".to_string(),
+            qty_delta: -qty,
+            reason: Some(format!("Order {} penyerahan / fulfilment", order_id)),
+            reason_code: Some("FULFILMENT".to_string()),
+            reference_type: Some("order_fulfilment".to_string()),
+            reference_id: Some(order_id.clone()),
+            idempotency_key: Some(ik),
+            created_by: user_id.to_string(),
+        }).await?;
+
+        // Release reservation
+        sqlx::query(
+            "UPDATE inventory_items SET qty_reserved = MAX(0.0, qty_reserved - ?), updated_at = CURRENT_TIMESTAMP WHERE (outlet_id = ? OR location_id = ?) AND product_id = ?"
+        )
+        .bind(qty)
+        .bind(&loc_id)
+        .bind(&loc_id)
+        .bind(&prod_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+
+    sqlx::query("UPDATE orders SET fulfilment_status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+        .bind(&order_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn cancel_omnichannel_order(
+    order_id: String,
+    pool: State<'_, SqlitePool>,
+) -> Result<(), String> {
+    crate::license::enforce_active_license().await?;
+    let user_id = crate::auth::get_current_user(pool.inner()).await?;
+
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+
+    let order = sqlx::query("SELECT merchant_id, outlet_id, COALESCE(fulfilment_location_id, outlet_id) as location_id, fulfilment_status FROM orders WHERE id = ?")
+        .bind(&order_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("Order tidak ditemukan")?;
+
+    let merchant_id: String = order.get("merchant_id");
+    let loc_id: String = order.get("location_id");
+    let current_status: String = order.get("fulfilment_status");
+
+    if current_status == "cancelled" {
+        tx.commit().await.map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    let items = sqlx::query("SELECT product_id, qty FROM order_items WHERE order_id = ? AND product_id IS NOT NULL")
+        .bind(&order_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    for item in items {
+        let prod_id: String = item.get("product_id");
+        let qty = crate::db::get_numeric_as_f64(&item, "qty");
+        release_omnichannel_reservation(&mut tx, &merchant_id, &loc_id, &prod_id, qty, &order_id, &user_id.to_string()).await?;
+    }
+
+    sqlx::query("UPDATE orders SET fulfilment_status = 'cancelled', payment_status = 'refunded', updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+        .bind(&order_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::establish_connection;
+    use crate::migration::run_migrations;
+
+    async fn setup_test_db() -> SqlitePool {
+        use sqlx::sqlite::SqlitePoolOptions;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        run_migrations(&pool).await.unwrap();
+        crate::seed::run_seed(&pool).await.unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn test_inventory_ledger_idempotency() {
+        let pool = setup_test_db().await;
+        let mut tx = pool.begin().await.unwrap();
+
+        let (user_id, merchant_id, outlet_id): (String, String, String) = sqlx::query_as(
+            "SELECT id, merchant_id, outlet_id FROM users LIMIT 1"
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+
+        let prod_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO products (id, merchant_id, sku, name, price, track_stock, active) VALUES (?, ?, 'TEST-SKU-1', 'Test Item 1', 10000, 1, 1)"
+        )
+        .bind(&prod_id)
+        .bind(&merchant_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+        let payload = StockMovementPayload {
+            merchant_id: merchant_id.clone(),
+            outlet_id: outlet_id.clone(),
+            product_id: prod_id.clone(),
+            movement_type: "INITIAL_STOCK".to_string(),
+            qty_delta: 50.0,
+            reason: Some("Init Test".to_string()),
+            reason_code: Some("INIT".to_string()),
+            reference_type: Some("test".to_string()),
+            reference_id: Some("ref-1".to_string()),
+            idempotency_key: Some("unique_key_123".to_string()),
+            created_by: user_id.clone(),
+        };
+
+        // First execution
+        let (sb1, sa1) = process_stock_movement_ledger(&mut tx, payload).await.unwrap();
+        assert_eq!(sb1, 0.0);
+        assert_eq!(sa1, 50.0);
+
+        // Retry execution with SAME idempotency_key
+        let payload_retry = StockMovementPayload {
+            merchant_id: merchant_id.clone(),
+            outlet_id: outlet_id.clone(),
+            product_id: prod_id.clone(),
+            movement_type: "INITIAL_STOCK".to_string(),
+            qty_delta: 50.0,
+            reason: Some("Init Test Retry".to_string()),
+            reason_code: Some("INIT".to_string()),
+            reference_type: Some("test".to_string()),
+            reference_id: Some("ref-1".to_string()),
+            idempotency_key: Some("unique_key_123".to_string()),
+            created_by: user_id.clone(),
+        };
+
+        let (sb2, sa2) = process_stock_movement_ledger(&mut tx, payload_retry).await.unwrap();
+        assert_eq!(sb2, 0.0);
+        assert_eq!(sa2, 50.0); // Stock is NOT added again! Total remains 50.0
+
+        let row = sqlx::query("SELECT qty_on_hand FROM inventory_items WHERE product_id = ?")
+            .bind(&prod_id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        let final_qty = crate::db::get_numeric_as_f64(&row, "qty_on_hand");
+        assert_eq!(final_qty, 50.0);
+
+        tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_sale_and_refund_reversal() {
+        let pool = setup_test_db().await;
+        let mut tx = pool.begin().await.unwrap();
+
+        let (user_id, merchant_id, outlet_id): (String, String, String) = sqlx::query_as(
+            "SELECT id, merchant_id, outlet_id FROM users LIMIT 1"
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+
+        let prod_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO products (id, merchant_id, sku, name, price, track_stock, active) VALUES (?, ?, 'TEST-SKU-SALE', 'Sale Item', 10000, 1, 1)"
+        )
+        .bind(&prod_id)
+        .bind(&merchant_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+        // 1. Initial stock 10
+        process_stock_movement_ledger(&mut tx, StockMovementPayload {
+            merchant_id: merchant_id.clone(),
+            outlet_id: outlet_id.clone(),
+            product_id: prod_id.clone(),
+            movement_type: "INITIAL_STOCK".to_string(),
+            qty_delta: 10.0,
+            reason: Some("Init".to_string()),
+            reason_code: None,
+            reference_type: None,
+            reference_id: None,
+            idempotency_key: Some("init_sale_1".to_string()),
+            created_by: user_id.clone(),
+        }).await.unwrap();
+
+        // 2. Sale 3 items
+        let (sb_sale, sa_sale) = process_stock_movement_ledger(&mut tx, StockMovementPayload {
+            merchant_id: merchant_id.clone(),
+            outlet_id: outlet_id.clone(),
+            product_id: prod_id.clone(),
+            movement_type: "SALE".to_string(),
+            qty_delta: -3.0,
+            reason: Some("Sale ord-1".to_string()),
+            reason_code: Some("SALE".to_string()),
+            reference_type: Some("order".to_string()),
+            reference_id: Some("ord-1".to_string()),
+            idempotency_key: Some("checkout_ord1_prod1".to_string()),
+            created_by: user_id.clone(),
+        }).await.unwrap();
+
+        assert_eq!(sb_sale, 10.0);
+        assert_eq!(sa_sale, 7.0);
+
+        // 3. Customer Return / Refund 3 items
+        let (sb_ref, sa_ref) = process_stock_movement_ledger(&mut tx, StockMovementPayload {
+            merchant_id: merchant_id.clone(),
+            outlet_id: outlet_id.clone(),
+            product_id: prod_id.clone(),
+            movement_type: "CUSTOMER_RETURN".to_string(),
+            qty_delta: 3.0,
+            reason: Some("Refund ord-1".to_string()),
+            reason_code: Some("CUSTOMER_RETURN".to_string()),
+            reference_type: Some("refund".to_string()),
+            reference_id: Some("ref-1".to_string()),
+            idempotency_key: Some("refund_ref1_prod1".to_string()),
+            created_by: user_id.clone(),
+        }).await.unwrap();
+
+        assert_eq!(sb_ref, 7.0);
+        assert_eq!(sa_ref, 10.0);
+
+        tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_negative_stock_policy() {
+        let pool = setup_test_db().await;
+        let mut tx = pool.begin().await.unwrap();
+
+        let (user_id, merchant_id, outlet_id): (String, String, String) = sqlx::query_as(
+            "SELECT id, merchant_id, outlet_id FROM users LIMIT 1"
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+
+        let prod_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO products (id, merchant_id, sku, name, price, track_stock, active) VALUES (?, ?, 'TEST-SKU-NEG', 'Test Neg Item', 10000, 1, 1)"
+        )
+        .bind(&prod_id)
+        .bind(&merchant_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+        // Ensure allow_negative_stock is 0
+        sqlx::query("INSERT OR REPLACE INTO system_settings (key, value) VALUES ('allow_negative_stock', '0')")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+
+        let payload_sale = StockMovementPayload {
+            merchant_id: merchant_id.clone(),
+            outlet_id: outlet_id.clone(),
+            product_id: prod_id.clone(),
+            movement_type: "SALE".to_string(),
+            qty_delta: -5.0,
+            reason: Some("Deduct overflow".to_string()),
+            reason_code: None,
+            reference_type: Some("order".to_string()),
+            reference_id: None,
+            idempotency_key: Some("neg_test_1".to_string()),
+            created_by: user_id.clone(),
+        };
+
+        // Negative stock should be rejected when policy = 0
+        let res = process_stock_movement_ledger(&mut tx, payload_sale).await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("Kebijakan stok negatif dinonaktifkan"));
+
+        // Enable negative stock policy = 1
+        sqlx::query("INSERT OR REPLACE INTO system_settings (key, value) VALUES ('allow_negative_stock', '1')")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+
+        let payload_sale_allowed = StockMovementPayload {
+            merchant_id: merchant_id.clone(),
+            outlet_id: outlet_id.clone(),
+            product_id: prod_id.clone(),
+            movement_type: "SALE".to_string(),
+            qty_delta: -5.0,
+            reason: Some("Deduct overflow allowed".to_string()),
+            reason_code: None,
+            reference_type: Some("order".to_string()),
+            reference_id: None,
+            idempotency_key: Some("neg_test_2".to_string()),
+            created_by: user_id.clone(),
+        };
+
+        let (sb, sa) = process_stock_movement_ledger(&mut tx, payload_sale_allowed).await.unwrap();
+        assert_eq!(sb, 0.0);
+        assert_eq!(sa, -5.0);
+
+        tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_omnichannel_sku_per_location_qty_breakdown() {
+        let pool = setup_test_db().await;
+        let mut tx = pool.begin().await.unwrap();
+
+        let (user_id, merchant_id, outlet_id): (String, String, String) = sqlx::query_as(
+            "SELECT id, merchant_id, outlet_id FROM users LIMIT 1"
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+
+        let prod_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO products (id, merchant_id, sku, name, price, track_stock, active) VALUES (?, ?, 'SKU-OMNI-1', 'Omni Shirt', 150000, 1, 1)"
+        )
+        .bind(&prod_id)
+        .bind(&merchant_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+        // 1. Initial stock 20
+        process_stock_movement_ledger(&mut tx, StockMovementPayload {
+            merchant_id: merchant_id.clone(),
+            outlet_id: outlet_id.clone(),
+            product_id: prod_id.clone(),
+            movement_type: "INITIAL_STOCK".to_string(),
+            qty_delta: 20.0,
+            reason: Some("Init stock".to_string()),
+            reason_code: None,
+            reference_type: None,
+            reference_id: None,
+            idempotency_key: Some("omni_init_1".to_string()),
+            created_by: user_id.clone(),
+        }).await.unwrap();
+
+        // 2. Reserve 5 items for web order
+        reserve_omnichannel_stock(&mut tx, &merchant_id, &outlet_id, &prod_id, 5.0, "web_ord_1", &user_id).await.unwrap();
+
+        tx.commit().await.unwrap();
+
+        // Check breakdown
+        let breakdown = get_product_stock_breakdown(&pool, &outlet_id, &prod_id).await.unwrap();
+        assert_eq!(breakdown.qty_on_hand, 20.0);
+        assert_eq!(breakdown.qty_reserved, 5.0);
+        assert_eq!(breakdown.qty_available, 15.0);
+    }
+
+    #[tokio::test]
+    async fn test_web_order_reservation_and_release() {
+        let pool = setup_test_db().await;
+        let mut tx = pool.begin().await.unwrap();
+
+        let (user_id, merchant_id, outlet_id): (String, String, String) = sqlx::query_as(
+            "SELECT id, merchant_id, outlet_id FROM users LIMIT 1"
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+
+        let prod_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO products (id, merchant_id, sku, name, price, track_stock, active) VALUES (?, ?, 'SKU-OMNI-2', 'Omni Shoes', 500000, 1, 1)"
+        )
+        .bind(&prod_id)
+        .bind(&merchant_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+
+        // 1. Initial stock 10
+        process_stock_movement_ledger(&mut tx, StockMovementPayload {
+            merchant_id: merchant_id.clone(),
+            outlet_id: outlet_id.clone(),
+            product_id: prod_id.clone(),
+            movement_type: "INITIAL_STOCK".to_string(),
+            qty_delta: 10.0,
+            reason: Some("Init stock".to_string()),
+            reason_code: None,
+            reference_type: None,
+            reference_id: None,
+            idempotency_key: Some("omni_init_2".to_string()),
+            created_by: user_id.clone(),
+        }).await.unwrap();
+
+        // 2. Reserve 3 items
+        reserve_omnichannel_stock(&mut tx, &merchant_id, &outlet_id, &prod_id, 3.0, "web_ord_2", &user_id).await.unwrap();
+
+        // 3. Release reservation (e.g. order cancelled)
+        release_omnichannel_reservation(&mut tx, &merchant_id, &outlet_id, &prod_id, 3.0, "web_ord_2", &user_id).await.unwrap();
+
+        tx.commit().await.unwrap();
+
+        let breakdown = get_product_stock_breakdown(&pool, &outlet_id, &prod_id).await.unwrap();
+        assert_eq!(breakdown.qty_on_hand, 10.0);
+        assert_eq!(breakdown.qty_reserved, 0.0);
+        assert_eq!(breakdown.qty_available, 10.0);
+    }
 }
 
 

@@ -226,50 +226,22 @@ pub async fn checkout(payload: CheckoutPayload, pool: State<'_, SqlitePool>) -> 
                     let total_deduct = item.qty * ing_qty_per_item;
 
                     if ing_track_stock {
-                        let result = sqlx::query(
-                            r#"
-                            UPDATE inventory_items 
-                            SET qty_on_hand = qty_on_hand - ?, updated_at = CURRENT_TIMESTAMP
-                            WHERE product_id = ? AND outlet_id = ?
-                            RETURNING qty_on_hand
-                            "#,
-                        )
-                        .bind(total_deduct)
-                        .bind(&ingredient_id)
-                        .bind(&outlet_id)
-                        .fetch_one(&mut *tx)
-                        .await;
-
-                        match result {
-                            Ok(row) => {
-                                let new_qty_on_hand: f64 = crate::db::get_numeric_as_f64(&row, "qty_on_hand");
-                                if new_qty_on_hand < 0.0 {
-                                    return Err(format!("Stok bahan baku '{}' tidak mencukupi untuk menu '{}'", ing_name, item.name));
-                                }
+                        crate::inventory::process_stock_movement_ledger(
+                            &mut tx,
+                            crate::inventory::StockMovementPayload {
+                                merchant_id: merchant_id.clone(),
+                                outlet_id: outlet_id.clone(),
+                                product_id: ingredient_id.clone(),
+                                movement_type: "PRODUCTION_CONSUMPTION".to_string(),
+                                qty_delta: -total_deduct,
+                                reason: Some(format!("Bahan baku pesanan {}", order_number)),
+                                reason_code: Some("PRODUCTION_CONSUMPTION".to_string()),
+                                reference_type: Some("order_ingredient".to_string()),
+                                reference_id: Some(order_id.to_string()),
+                                idempotency_key: Some(format!("recipe_{}_{}_{}", order_id, product_id, ingredient_id)),
+                                created_by: user_id.clone(),
                             }
-                            Err(e) => {
-                                return Err(format!("Stok bahan baku '{}' tidak ditemukan untuk outlet ini: {}", ing_name, e));
-                            }
-                        }
-
-                        // Insert stock movement for ingredient
-                        sqlx::query(
-                            r#"
-                            INSERT INTO stock_movements (
-                                id, merchant_id, outlet_id, product_id, movement_type, qty_delta, reference_type, reference_id, created_by, created_at
-                            ) VALUES (?, ?, ?, ?, 'sale', ?, 'order_ingredient', ?, ?, CURRENT_TIMESTAMP)
-                            "#
-                        )
-                        .bind(Uuid::new_v4().to_string())
-                        .bind(&merchant_id)
-                        .bind(&outlet_id)
-                        .bind(&ingredient_id)
-                        .bind(-total_deduct)
-                        .bind(order_id.to_string())
-                        .bind(&user_id)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| e.to_string())?;
+                        ).await?;
                     }
                 }
 
@@ -281,50 +253,22 @@ pub async fn checkout(payload: CheckoutPayload, pool: State<'_, SqlitePool>) -> 
                     .unwrap_or(true);
 
                 if track_stock {
-                    let result = sqlx::query(
-                        r#"
-                        UPDATE inventory_items 
-                        SET qty_on_hand = qty_on_hand - ?, updated_at = CURRENT_TIMESTAMP
-                        WHERE product_id = ? AND outlet_id = ?
-                        RETURNING qty_on_hand
-                        "#,
-                    )
-                    .bind(item.qty)
-                    .bind(product_id.to_string())
-                    .bind(&outlet_id)
-                    .fetch_one(&mut *tx)
-                    .await;
-
-                    match result {
-                        Ok(row) => {
-                            let new_qty_on_hand: f64 = crate::db::get_numeric_as_f64(&row, "qty_on_hand");
-                            if new_qty_on_hand < 0.0 {
-                                return Err(format!("Stok tidak cukup untuk produk: {}", item.name));
-                            }
+                    crate::inventory::process_stock_movement_ledger(
+                        &mut tx,
+                        crate::inventory::StockMovementPayload {
+                            merchant_id: merchant_id.clone(),
+                            outlet_id: outlet_id.clone(),
+                            product_id: product_id.to_string(),
+                            movement_type: "SALE".to_string(),
+                            qty_delta: -item.qty,
+                            reason: Some(format!("Penjualan pesanan {}", order_number)),
+                            reason_code: Some("SALE".to_string()),
+                            reference_type: Some("order".to_string()),
+                            reference_id: Some(order_id.to_string()),
+                            idempotency_key: Some(format!("checkout_{}_{}", order_id, product_id)),
+                            created_by: user_id.clone(),
                         }
-                        Err(e) => {
-                            return Err(format!("Inventory not found for {}: {}", item.name, e));
-                        }
-                    }
-
-                    // Insert stock movement
-                    sqlx::query(
-                        r#"
-                        INSERT INTO stock_movements (
-                            id, merchant_id, outlet_id, product_id, movement_type, qty_delta, reference_type, reference_id, created_by, created_at
-                        ) VALUES (?, ?, ?, ?, 'sale', ?, 'order', ?, ?, CURRENT_TIMESTAMP)
-                        "#,
-                    )
-                    .bind(Uuid::new_v4().to_string())
-                    .bind(&merchant_id)
-                    .bind(&outlet_id)
-                    .bind(product_id.to_string())
-                    .bind(-item.qty)
-                    .bind(order_id.to_string())
-                    .bind(&user_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                    ).await?;
                 }
             }
         }
@@ -350,7 +294,7 @@ pub async fn checkout(payload: CheckoutPayload, pool: State<'_, SqlitePool>) -> 
     // Audit Log
     crate::audit::log_action(
         &mut *tx, 
-        merchant_id, 
+        merchant_id.clone(), 
         Some(outlet_id.clone()), 
         user_id.clone(), 
         "checkout", 
@@ -530,6 +474,34 @@ pub async fn checkout(payload: CheckoutPayload, pool: State<'_, SqlitePool>) -> 
             }
         }
     }
+
+    // Atomic Outbox Sync Event insertion
+    let outbox_payload = serde_json::json!({
+        "orderId": order_id.to_string(),
+        "orderNumber": order_number,
+        "merchantId": merchant_id,
+        "outletId": outlet_id,
+        "grandTotal": payload.grand_total,
+        "paymentMethod": payload.payment_method,
+        "itemsCount": payload.items.len(),
+    });
+
+    let idempotency_key = format!("checkout_{}", order_id);
+    sqlx::query(
+        r#"
+        INSERT INTO sync_queue (
+            id, aggregate_type, aggregate_id, action_type, payload_version, payload_json,
+            idempotency_key, status, retry_count, created_at
+        ) VALUES (?, 'ORDER', ?, 'CHECKOUT', 1, ?, ?, 'PENDING', 0, CURRENT_TIMESTAMP)
+        "#
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(order_id.to_string())
+    .bind(outbox_payload.to_string())
+    .bind(&idempotency_key)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
 
     tx.commit().await.map_err(|e| e.to_string())?;
 

@@ -75,38 +75,22 @@ pub async fn process_refund(order_id: Uuid, reason: String, pool: State<'_, Sqli
         let product_id: String = item.get("product_id");
         let qty: f64 = crate::db::get_numeric_as_f64(&item, "qty");
 
-        sqlx::query(
-            r#"
-            UPDATE inventory_items 
-            SET qty_on_hand = qty_on_hand + ?, updated_at = CURRENT_TIMESTAMP
-            WHERE product_id = ? AND outlet_id = ?
-            "#,
-        )
-        .bind(qty)
-        .bind(&product_id)
-        .bind(&outlet_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-
-        // 5. Stock Movement
-        sqlx::query(
-            r#"
-            INSERT INTO stock_movements (
-                id, merchant_id, outlet_id, product_id, movement_type, qty_delta, reference_type, reference_id, created_by, created_at
-            ) VALUES (?, ?, ?, ?, 'refund', ?, 'refund', ?, ?, CURRENT_TIMESTAMP)
-            "#,
-        )
-        .bind(Uuid::new_v4().to_string())
-        .bind(&merchant_id)
-        .bind(&outlet_id)
-        .bind(&product_id)
-        .bind(qty)
-        .bind(refund_id.to_string())
-        .bind(user_id.to_string())
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
+        crate::inventory::process_stock_movement_ledger(
+            &mut tx,
+            crate::inventory::StockMovementPayload {
+                merchant_id: merchant_id.clone(),
+                outlet_id: outlet_id.clone(),
+                product_id: product_id.clone(),
+                movement_type: "CUSTOMER_RETURN".to_string(),
+                qty_delta: qty,
+                reason: Some(reason.clone()),
+                reason_code: Some("CUSTOMER_RETURN".to_string()),
+                reference_type: Some("refund".to_string()),
+                reference_id: Some(refund_id.to_string()),
+                idempotency_key: Some(format!("refund_{}_{}", refund_id, product_id)),
+                created_by: user_id.to_string(),
+            }
+        ).await?;
     }
 
     // 6. Audit Log
